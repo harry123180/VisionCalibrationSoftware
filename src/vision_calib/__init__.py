@@ -1,14 +1,14 @@
 """
-vision-calib: Camera Calibration Toolkit
+TSIC/CR-ICS01: 相機與手臂整合控制教學軟體
 
 A professional camera calibration tool for computing intrinsic and extrinsic
 parameters using checkerboard patterns.
 
-License: Apache 2.0
+開發單位: TSIC
 """
 
 __version__ = "1.0.0"
-__author__ = "vision-calib contributors"
+__author__ = "TSIC"
 
 from vision_calib.core.types import (
     CameraIntrinsic,

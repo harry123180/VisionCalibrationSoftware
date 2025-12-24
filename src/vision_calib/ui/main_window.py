@@ -50,7 +50,7 @@ class MainWindow(QMainWindow):
         # 主題管理器
         self.theme_manager = ThemeManager()
 
-        self.setWindowTitle(f"Vision Calib v{__version__}")
+        self.setWindowTitle(f"TSIC/CR-ICS01 相機與手臂整合控制教學軟體 v{__version__}")
         self.setMinimumSize(800, 500)
         self.resize(1280, 800)
 
@@ -69,6 +69,12 @@ class MainWindow(QMainWindow):
 
         # 座標轉換器
         self._transformer = None
+
+        # 點位數據 [id, image_x, image_y, world_x, world_y]
+        self._point_data: list = []
+
+        # 生成的世界座標
+        self._generated_world_coords: list = []
 
         # 設置 UI
         self._setup_ui()
@@ -167,12 +173,14 @@ class MainWindow(QMainWindow):
         self.cols_spin.setRange(2, 50)
         self.cols_spin.setValue(17)
         self.cols_spin.setToolTip("棋盤格內部角點的水平數量（與原工具「寬度」相同）")
+        self.cols_spin.valueChanged.connect(self._on_global_param_changed)
         cb_layout.addRow("寬度(角點數)：", self.cols_spin)
 
         self.rows_spin = QSpinBox()
         self.rows_spin.setRange(2, 50)
         self.rows_spin.setValue(12)
         self.rows_spin.setToolTip("棋盤格內部角點的垂直數量（與原工具「高度」相同）")
+        self.rows_spin.valueChanged.connect(self._on_global_param_changed)
         cb_layout.addRow("高度(角點數)：", self.rows_spin)
 
         self.square_size_spin = QDoubleSpinBox()
@@ -181,6 +189,7 @@ class MainWindow(QMainWindow):
         self.square_size_spin.setDecimals(2)
         self.square_size_spin.setSuffix(" cm")
         self.square_size_spin.setToolTip("棋盤格每個方格的實際邊長（公分）")
+        self.square_size_spin.valueChanged.connect(self._on_global_param_changed)
         cb_layout.addRow("方格邊長：", self.square_size_spin)
 
         layout.addWidget(cb_group)
@@ -260,6 +269,8 @@ class MainWindow(QMainWindow):
 
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(self._create_intrinsic_tab(), "內參標定")
+        self.tab_widget.addTab(self._create_points_tab(), "點位數據")
+        self.tab_widget.addTab(self._create_chessboard_gen_tab(), "棋盤生成")
         self.tab_widget.addTab(self._create_extrinsic_tab(), "外參計算")
         self.tab_widget.addTab(self._create_transform_tab(), "座標轉換")
 
@@ -345,12 +356,583 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
         return widget
 
+    def _create_points_tab(self) -> QWidget:
+        """建立點位數據管理頁籤"""
+        from PySide6.QtWidgets import (
+            QTextEdit, QGroupBox, QPushButton,
+            QFormLayout, QTableWidget, QTableWidgetItem, QHeaderView,
+            QDoubleSpinBox, QSpinBox, QScrollArea,
+        )
+
+        # 外層容器
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 捲動區域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # 說明
+        header = QLabel("點位數據管理")
+        header.setProperty("heading", True)
+        layout.addWidget(header)
+
+        desc = QLabel("管理像素座標與世界座標的對應關係，用於外參計算")
+        desc.setProperty("subheading", True)
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # ===== 手動添加點位 =====
+        add_group = QGroupBox("添加點位")
+        add_layout = QFormLayout(add_group)
+        add_layout.setContentsMargins(12, 20, 12, 12)
+        add_layout.setSpacing(8)
+        add_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        # 點位 ID
+        self.point_id_spin = QSpinBox()
+        self.point_id_spin.setRange(1, 9999)
+        self.point_id_spin.setValue(1)
+        self.point_id_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        add_layout.addRow("點位 ID：", self.point_id_spin)
+
+        # 像素座標
+        pixel_layout = QHBoxLayout()
+        pixel_layout.setSpacing(8)
+        self.point_img_x_spin = QDoubleSpinBox()
+        self.point_img_x_spin.setRange(0, 10000)
+        self.point_img_x_spin.setDecimals(2)
+        self.point_img_x_spin.setSuffix(" px")
+        self.point_img_x_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        pixel_layout.addWidget(QLabel("X:"))
+        pixel_layout.addWidget(self.point_img_x_spin, 1)
+        self.point_img_y_spin = QDoubleSpinBox()
+        self.point_img_y_spin.setRange(0, 10000)
+        self.point_img_y_spin.setDecimals(2)
+        self.point_img_y_spin.setSuffix(" px")
+        self.point_img_y_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        pixel_layout.addWidget(QLabel("Y:"))
+        pixel_layout.addWidget(self.point_img_y_spin, 1)
+        add_layout.addRow("像素座標：", pixel_layout)
+
+        # 世界座標
+        world_layout = QHBoxLayout()
+        world_layout.setSpacing(8)
+        self.point_world_x_spin = QDoubleSpinBox()
+        self.point_world_x_spin.setRange(-10000, 10000)
+        self.point_world_x_spin.setDecimals(2)
+        self.point_world_x_spin.setSuffix(" mm")
+        self.point_world_x_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        world_layout.addWidget(QLabel("X:"))
+        world_layout.addWidget(self.point_world_x_spin, 1)
+        self.point_world_y_spin = QDoubleSpinBox()
+        self.point_world_y_spin.setRange(-10000, 10000)
+        self.point_world_y_spin.setDecimals(2)
+        self.point_world_y_spin.setSuffix(" mm")
+        self.point_world_y_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        world_layout.addWidget(QLabel("Y:"))
+        world_layout.addWidget(self.point_world_y_spin, 1)
+        add_layout.addRow("世界座標：", world_layout)
+
+        # 添加按鈕
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+        add_point_btn = QPushButton("添加點位")
+        add_point_btn.clicked.connect(self._on_add_point)
+        add_point_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        btn_layout.addWidget(add_point_btn)
+
+        clear_points_btn = QPushButton("清除全部")
+        clear_points_btn.setProperty("secondary", True)
+        clear_points_btn.clicked.connect(self._on_clear_points)
+        clear_points_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        btn_layout.addWidget(clear_points_btn)
+        add_layout.addRow("", btn_layout)
+
+        layout.addWidget(add_group)
+
+        # ===== 點位列表 =====
+        list_group = QGroupBox(f"當前點位 (共 0 個)")
+        self.points_list_group = list_group
+        list_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        list_layout = QVBoxLayout(list_group)
+        list_layout.setContentsMargins(12, 20, 12, 12)
+
+        # 表格
+        self.points_table = QTableWidget()
+        self.points_table.setColumnCount(5)
+        self.points_table.setHorizontalHeaderLabels(["ID", "像素X", "像素Y", "世界X", "世界Y"])
+        self.points_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.points_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.points_table.setMinimumHeight(150)
+        list_layout.addWidget(self.points_table)
+
+        # 匯入/匯出
+        io_layout = QHBoxLayout()
+        io_layout.setSpacing(8)
+        import_csv_btn = QPushButton("匯入CSV")
+        import_csv_btn.clicked.connect(self._on_import_points_csv)
+        import_csv_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        io_layout.addWidget(import_csv_btn)
+
+        export_csv_btn = QPushButton("匯出CSV")
+        export_csv_btn.clicked.connect(self._on_export_points_csv)
+        export_csv_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        io_layout.addWidget(export_csv_btn)
+
+        load_from_corners_btn = QPushButton("從角點載入")
+        load_from_corners_btn.clicked.connect(self._on_load_corners_to_points)
+        load_from_corners_btn.setToolTip("將偵測到的角點載入為像素座標")
+        load_from_corners_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        io_layout.addWidget(load_from_corners_btn)
+
+        list_layout.addLayout(io_layout)
+        layout.addWidget(list_group, 1)
+
+        scroll.setWidget(widget)
+        container_layout.addWidget(scroll)
+
+        return container
+
+    def _create_chessboard_gen_tab(self) -> QWidget:
+        """建立棋盤格世界座標生成頁籤 - 簡化版：使用左側全局棋盤格參數"""
+        from PySide6.QtWidgets import (
+            QTextEdit, QGroupBox, QPushButton,
+            QFormLayout, QDoubleSpinBox, QSpinBox, QComboBox,
+            QCheckBox,
+        )
+
+        # 主容器 - 上下分割：上方可視化，下方控制
+        container = QWidget()
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
+
+        # ========== 上方：可視化區域（佔主要空間）==========
+        vis_container = QWidget()
+        vis_layout = QVBoxLayout(vis_container)
+        vis_layout.setContentsMargins(0, 0, 0, 0)
+        vis_layout.setSpacing(8)
+
+        # 標題行
+        header_layout = QHBoxLayout()
+        header = QLabel("座標系可視化")
+        header.setProperty("heading", True)
+        header_layout.addWidget(header)
+        header_layout.addStretch()
+
+        # 顯示控制 - 使用明顯的切換按鈕樣式
+        toggle_frame = QFrame()
+        toggle_frame.setStyleSheet("""
+            QFrame {
+                background-color: #f1f3f4;
+                border-radius: 8px;
+                padding: 4px;
+            }
+        """)
+        toggle_layout = QHBoxLayout(toggle_frame)
+        toggle_layout.setContentsMargins(4, 4, 4, 4)
+        toggle_layout.setSpacing(4)
+
+        toggle_style = """
+            QPushButton {
+                background-color: transparent;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 13px;
+                color: #5f6368;
+            }
+            QPushButton:checked {
+                background-color: #1a73e8;
+                color: white;
+            }
+            QPushButton:hover:!checked {
+                background-color: #e8eaed;
+            }
+        """
+
+        self.show_image_coords_btn = QPushButton("視覺座標")
+        self.show_image_coords_btn.setCheckable(True)
+        self.show_image_coords_btn.setChecked(True)
+        self.show_image_coords_btn.setStyleSheet(toggle_style)
+        self.show_image_coords_btn.clicked.connect(self._update_chessboard_vis)
+        toggle_layout.addWidget(self.show_image_coords_btn)
+
+        self.show_world_coords_btn = QPushButton("世界座標")
+        self.show_world_coords_btn.setCheckable(True)
+        self.show_world_coords_btn.setChecked(True)
+        self.show_world_coords_btn.setStyleSheet(toggle_style)
+        self.show_world_coords_btn.clicked.connect(self._update_chessboard_vis)
+        toggle_layout.addWidget(self.show_world_coords_btn)
+
+        self.show_corners_btn = QPushButton("偵測角點")
+        self.show_corners_btn.setCheckable(True)
+        self.show_corners_btn.setChecked(False)
+        self.show_corners_btn.setStyleSheet(toggle_style)
+        self.show_corners_btn.clicked.connect(self._update_chessboard_vis)
+        toggle_layout.addWidget(self.show_corners_btn)
+
+        header_layout.addWidget(toggle_frame)
+        vis_layout.addLayout(header_layout)
+
+        # Matplotlib 畫布
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+            from matplotlib.figure import Figure
+            import matplotlib
+            matplotlib.use('QtAgg')
+
+            # 設置中文字體
+            import matplotlib.pyplot as plt
+            plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS', 'sans-serif']
+            plt.rcParams['axes.unicode_minus'] = False
+
+            self.chessboard_fig = Figure(figsize=(10, 6), dpi=100)
+            self.chessboard_ax = self.chessboard_fig.add_subplot(111)
+            self.chessboard_canvas = FigureCanvas(self.chessboard_fig)
+            self.chessboard_canvas.setMinimumHeight(300)
+
+            # 啟用滾輪縮放和拖動
+            self._chessboard_vis_pressed = False
+            self._chessboard_vis_last_x = 0
+            self._chessboard_vis_last_y = 0
+            self.chessboard_canvas.mpl_connect('scroll_event', self._on_chessboard_scroll)
+            self.chessboard_canvas.mpl_connect('button_press_event', self._on_chessboard_press)
+            self.chessboard_canvas.mpl_connect('button_release_event', self._on_chessboard_release)
+            self.chessboard_canvas.mpl_connect('motion_notify_event', self._on_chessboard_motion)
+
+            vis_layout.addWidget(self.chessboard_canvas, 1)
+
+        except ImportError:
+            fallback_label = QLabel("需要安裝 matplotlib 才能顯示座標可視化\npip install matplotlib")
+            fallback_label.setAlignment(Qt.AlignCenter)
+            fallback_label.setStyleSheet("color: #666; font-size: 14px; padding: 40px;")
+            vis_layout.addWidget(fallback_label, 1)
+            self.chessboard_canvas = None
+
+        main_layout.addWidget(vis_container, 1)  # stretch=1，佔主要空間
+
+        # ========== 下方：控制區域（精簡）==========
+        ctrl_container = QWidget()
+        ctrl_layout = QHBoxLayout(ctrl_container)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_layout.setSpacing(16)
+
+        # --- 機械臂原點設定 ---
+        origin_group = QGroupBox("機械臂原點")
+        origin_layout = QFormLayout(origin_group)
+        origin_layout.setContentsMargins(12, 16, 12, 12)
+        origin_layout.setSpacing(6)
+
+        # 原點座標 (X, Y)
+        origin_coord_layout = QHBoxLayout()
+        origin_coord_layout.setSpacing(4)
+        self.origin_x_spin = QDoubleSpinBox()
+        self.origin_x_spin.setRange(-10000, 10000)
+        self.origin_x_spin.setDecimals(1)
+        self.origin_x_spin.setValue(0.0)
+        self.origin_x_spin.setSuffix(" mm")
+        self.origin_x_spin.valueChanged.connect(self._update_chessboard_vis)
+        origin_coord_layout.addWidget(QLabel("X:"))
+        origin_coord_layout.addWidget(self.origin_x_spin)
+        self.origin_y_spin = QDoubleSpinBox()
+        self.origin_y_spin.setRange(-10000, 10000)
+        self.origin_y_spin.setDecimals(1)
+        self.origin_y_spin.setValue(0.0)
+        self.origin_y_spin.setSuffix(" mm")
+        self.origin_y_spin.valueChanged.connect(self._update_chessboard_vis)
+        origin_coord_layout.addWidget(QLabel("Y:"))
+        origin_coord_layout.addWidget(self.origin_y_spin)
+        origin_layout.addRow("座標：", origin_coord_layout)
+
+        # 對應角點編號
+        self.robot_origin_point_spin = QSpinBox()
+        self.robot_origin_point_spin.setRange(1, 9999)
+        self.robot_origin_point_spin.setValue(204)
+        self.robot_origin_point_spin.setToolTip("棋盤格上對應機械臂原點的角點編號")
+        self.robot_origin_point_spin.valueChanged.connect(self._update_chessboard_vis)
+        origin_layout.addRow("角點 ID：", self.robot_origin_point_spin)
+
+        ctrl_layout.addWidget(origin_group)
+
+        # --- 座標軸方向 ---
+        dir_group = QGroupBox("座標軸對應")
+        dir_layout = QFormLayout(dir_group)
+        dir_layout.setContentsMargins(12, 16, 12, 12)
+        dir_layout.setSpacing(6)
+
+        self.robot_x_dir_combo = QComboBox()
+        self.robot_x_dir_combo.addItem("圖像Y+ (向下)", "image_y_positive")
+        self.robot_x_dir_combo.addItem("圖像Y- (向上)", "image_y_negative")
+        self.robot_x_dir_combo.addItem("圖像X+ (向右)", "image_x_positive")
+        self.robot_x_dir_combo.addItem("圖像X- (向左)", "image_x_negative")
+        self.robot_x_dir_combo.currentIndexChanged.connect(self._update_chessboard_vis)
+        dir_layout.addRow("機械臂 X+：", self.robot_x_dir_combo)
+
+        self.robot_y_dir_combo = QComboBox()
+        self.robot_y_dir_combo.addItem("圖像X+ (向右)", "image_x_positive")
+        self.robot_y_dir_combo.addItem("圖像X- (向左)", "image_x_negative")
+        self.robot_y_dir_combo.addItem("圖像Y+ (向下)", "image_y_positive")
+        self.robot_y_dir_combo.addItem("圖像Y- (向上)", "image_y_negative")
+        self.robot_y_dir_combo.currentIndexChanged.connect(self._update_chessboard_vis)
+        dir_layout.addRow("機械臂 Y+：", self.robot_y_dir_combo)
+
+        ctrl_layout.addWidget(dir_group)
+
+        # --- 操作按鈕 + 結果 ---
+        action_group = QGroupBox("操作")
+        action_layout = QVBoxLayout(action_group)
+        action_layout.setContentsMargins(12, 16, 12, 12)
+        action_layout.setSpacing(6)
+
+        gen_btn = QPushButton("生成世界座標")
+        gen_btn.clicked.connect(self._on_generate_world_coords)
+        gen_btn.setToolTip("使用左側「棋盤格參數」生成世界座標")
+        action_layout.addWidget(gen_btn)
+
+        load_btn = QPushButton("載入到點位數據")
+        load_btn.clicked.connect(self._on_load_world_coords_to_points)
+        load_btn.setToolTip("合併角點與世界座標")
+        action_layout.addWidget(load_btn)
+
+        self.chessboard_gen_status = QLabel("使用左側棋盤格參數")
+        self.chessboard_gen_status.setProperty("subheading", True)
+        self.chessboard_gen_status.setWordWrap(True)
+        action_layout.addWidget(self.chessboard_gen_status)
+
+        ctrl_layout.addWidget(action_group)
+
+        # --- 結果摘要 ---
+        result_group = QGroupBox("生成結果")
+        result_layout = QVBoxLayout(result_group)
+        result_layout.setContentsMargins(12, 16, 12, 12)
+
+        self.chessboard_gen_result = QTextEdit()
+        self.chessboard_gen_result.setReadOnly(True)
+        self.chessboard_gen_result.setMaximumHeight(80)
+        self.chessboard_gen_result.setPlaceholderText("點擊「生成世界座標」查看結果")
+        result_layout.addWidget(self.chessboard_gen_result)
+
+        ctrl_layout.addWidget(result_group, 1)
+
+        main_layout.addWidget(ctrl_container)
+
+        # 初始繪製
+        if hasattr(self, 'chessboard_canvas') and self.chessboard_canvas:
+            self._init_chessboard_vis()
+
+        return container
+
+    def _on_global_param_changed(self):
+        """當左側全局棋盤格參數變更時更新可視化"""
+        if hasattr(self, 'chessboard_ax') and self.chessboard_ax is not None:
+            self._update_chessboard_vis()
+
+    def _init_chessboard_vis(self):
+        """初始化棋盤格可視化"""
+        if not hasattr(self, 'chessboard_ax') or self.chessboard_ax is None:
+            return
+        self._update_chessboard_vis()
+
+    def _update_chessboard_vis(self):
+        """更新棋盤格座標可視化"""
+        if not hasattr(self, 'chessboard_ax') or self.chessboard_ax is None:
+            return
+
+        import numpy as np
+
+        self.chessboard_ax.clear()
+
+        # 獲取當前設置（使用左側全局棋盤格參數）
+        try:
+            grid_x = self.cols_spin.value()  # 使用全局參數
+            grid_y = self.rows_spin.value()  # 使用全局參數
+            robot_point = self.robot_origin_point_spin.value()
+            spacing = self.square_size_spin.value() * 10  # cm → mm
+        except:
+            grid_x, grid_y, robot_point, spacing = 17, 12, 204, 10.0
+
+        # ===== 顯示視覺座標系（模擬的棋盤格點位）=====
+        if self.show_image_coords_btn.isChecked():
+            points_x = []
+            points_y = []
+            for j in range(grid_y):
+                for i in range(grid_x):
+                    x = 200 + i * 40
+                    y = 150 + j * 40
+                    points_x.append(x)
+                    points_y.append(y)
+
+            self.chessboard_ax.scatter(points_x, points_y, c='lightblue', s=60, alpha=0.7,
+                                       edgecolor='blue', label='視覺座標系點位', marker='s')
+
+            # 標出機械臂原點在視覺座標系中的位置
+            if 1 <= robot_point <= len(points_x):
+                robot_idx = robot_point - 1
+                robot_x = points_x[robot_idx]
+                robot_y = points_y[robot_idx]
+
+                self.chessboard_ax.scatter([robot_x], [robot_y], c='red', s=200, marker='*',
+                                           edgecolor='darkred', linewidth=2, label=f'機械臂原點 (P{robot_point})')
+
+                # 繪製機械臂座標軸方向
+                robot_x_dir = self.robot_x_dir_combo.currentData()
+                robot_y_dir = self.robot_y_dir_combo.currentData()
+
+                arrow_length = 80
+                robot_x_dx, robot_x_dy = self._get_direction_vector(robot_x_dir, arrow_length)
+                robot_y_dx, robot_y_dy = self._get_direction_vector(robot_y_dir, arrow_length)
+
+                self.chessboard_ax.arrow(robot_x, robot_y, robot_x_dx, robot_x_dy,
+                                         head_width=12, head_length=15, fc='green', ec='green', linewidth=3)
+                self.chessboard_ax.arrow(robot_x, robot_y, robot_y_dx, robot_y_dy,
+                                         head_width=12, head_length=15, fc='orange', ec='orange', linewidth=3)
+
+                self.chessboard_ax.text(robot_x + robot_x_dx + 15, robot_y + robot_x_dy + 15, '機械臂X+',
+                                        fontsize=10, color='green', weight='bold')
+                self.chessboard_ax.text(robot_x + robot_y_dx + 15, robot_y + robot_y_dy + 15, '機械臂Y+',
+                                        fontsize=10, color='orange', weight='bold')
+
+        # ===== 顯示真實世界座標系 =====
+        if self.show_world_coords_btn.isChecked() and self._generated_world_coords:
+            world_coords = np.array(self._generated_world_coords)
+            world_x = world_coords[:, 1]
+            world_y = world_coords[:, 2]
+
+            self.chessboard_ax.scatter(world_x, world_y, c='lightgreen', s=60, alpha=0.7,
+                                       edgecolor='darkgreen', label='真實世界座標', marker='o')
+
+            # 標出機械臂原點在世界座標系中的位置
+            if 1 <= robot_point <= len(world_coords):
+                robot_world_x = world_coords[robot_point - 1, 1]
+                robot_world_y = world_coords[robot_point - 1, 2]
+
+                self.chessboard_ax.scatter([robot_world_x], [robot_world_y], c='darkred', s=200, marker='*',
+                                           edgecolor='red', linewidth=2, label='機械臂原點 (世界座標)')
+
+                # 世界座標系中的軸
+                self.chessboard_ax.arrow(robot_world_x, robot_world_y, spacing * 2, 0,
+                                         head_width=spacing * 0.5, head_length=spacing * 0.6, fc='cyan', ec='cyan', linewidth=3)
+                self.chessboard_ax.arrow(robot_world_x, robot_world_y, 0, spacing * 2,
+                                         head_width=spacing * 0.5, head_length=spacing * 0.6, fc='magenta', ec='magenta', linewidth=3)
+
+                self.chessboard_ax.text(robot_world_x + spacing * 2 + 5, robot_world_y + 5, '世界X+',
+                                        fontsize=10, color='cyan', weight='bold')
+                self.chessboard_ax.text(robot_world_x + 5, robot_world_y + spacing * 2 + 5, '世界Y+',
+                                        fontsize=10, color='magenta', weight='bold')
+
+        # ===== 顯示偵測到的角點 =====
+        if self.show_corners_btn.isChecked() and self._corner_cache:
+            # 使用第一張圖的角點作為示例
+            first_corners = list(self._corner_cache.values())[0] if self._corner_cache else None
+            if first_corners is not None:
+                corners = np.array(first_corners).reshape(-1, 2)
+                self.chessboard_ax.scatter(corners[:, 0], corners[:, 1],
+                                           c='red', s=100, marker='+', alpha=0.8, linewidths=3,
+                                           label='偵測到的角點')
+
+                # 標註部分角點編號
+                step = max(1, len(corners) // 20)
+                for i in range(0, len(corners), step):
+                    corner = corners[i]
+                    self.chessboard_ax.annotate(f'P{i + 1}', (corner[0], corner[1]),
+                                                xytext=(5, 5), textcoords='offset points',
+                                                fontsize=8, color='darkred', weight='bold',
+                                                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
+
+        # 設置圖表屬性
+        self.chessboard_ax.set_title('棋盤格座標系設置', fontsize=14, fontweight='bold')
+        self.chessboard_ax.set_xlabel('X座標')
+        self.chessboard_ax.set_ylabel('Y座標')
+        self.chessboard_ax.legend(loc='upper right', fontsize=9)
+        self.chessboard_ax.grid(True, alpha=0.3)
+        self.chessboard_ax.axis('equal')
+
+        self.chessboard_canvas.draw()
+
+    def _get_direction_vector(self, direction: str, length: float) -> tuple:
+        """根據方向字串返回向量"""
+        vectors = {
+            "image_x_positive": (length, 0),
+            "image_x_negative": (-length, 0),
+            "image_y_positive": (0, length),
+            "image_y_negative": (0, -length),
+        }
+        return vectors.get(direction, (0, 0))
+
+    def _on_chessboard_scroll(self, event):
+        """棋盤格可視化滾輪縮放"""
+        if event.inaxes != self.chessboard_ax:
+            return
+
+        xlim = self.chessboard_ax.get_xlim()
+        ylim = self.chessboard_ax.get_ylim()
+
+        scale_factor = 1.2 if event.step > 0 else 1 / 1.2
+
+        x_center = event.xdata if event.xdata else (xlim[0] + xlim[1]) / 2
+        y_center = event.ydata if event.ydata else (ylim[0] + ylim[1]) / 2
+
+        x_range = (xlim[1] - xlim[0]) / scale_factor
+        y_range = (ylim[1] - ylim[0]) / scale_factor
+
+        self.chessboard_ax.set_xlim([x_center - x_range / 2, x_center + x_range / 2])
+        self.chessboard_ax.set_ylim([y_center - y_range / 2, y_center + y_range / 2])
+        self.chessboard_canvas.draw()
+
+    def _on_chessboard_press(self, event):
+        """棋盤格可視化滑鼠按下"""
+        if event.button == 3 and event.inaxes == self.chessboard_ax:
+            self._chessboard_vis_pressed = True
+            self._chessboard_vis_last_x = event.xdata
+            self._chessboard_vis_last_y = event.ydata
+
+    def _on_chessboard_release(self, event):
+        """棋盤格可視化滑鼠釋放"""
+        if event.button == 3:
+            self._chessboard_vis_pressed = False
+
+    def _on_chessboard_motion(self, event):
+        """棋盤格可視化滑鼠拖動"""
+        if self._chessboard_vis_pressed and event.inaxes == self.chessboard_ax and event.xdata and event.ydata:
+            dx = event.xdata - self._chessboard_vis_last_x
+            dy = event.ydata - self._chessboard_vis_last_y
+
+            xlim = self.chessboard_ax.get_xlim()
+            ylim = self.chessboard_ax.get_ylim()
+
+            self.chessboard_ax.set_xlim([xlim[0] - dx, xlim[1] - dx])
+            self.chessboard_ax.set_ylim([ylim[0] - dy, ylim[1] - dy])
+
+            self._chessboard_vis_last_x = event.xdata
+            self._chessboard_vis_last_y = event.ydata
+
+            self.chessboard_canvas.draw()
+
     def _create_extrinsic_tab(self) -> QWidget:
         """建立外參計算頁籤"""
         from PySide6.QtWidgets import (
             QTextEdit, QGroupBox, QComboBox, QPushButton,
-            QFormLayout, QGraphicsView, QGraphicsScene,
+            QFormLayout, QRadioButton, QButtonGroup, QScrollArea,
         )
+
+        # 外層容器
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 捲動區域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
 
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -362,32 +944,92 @@ class MainWindow(QMainWindow):
         header.setProperty("heading", True)
         layout.addWidget(header)
 
-        desc = QLabel("選擇一張圖像作為世界座標系原點（棋盤格左上角）")
+        desc = QLabel("使用 solvePnP 計算相機相對於世界座標系的位姿")
         desc.setProperty("subheading", True)
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        # 設定區
-        settings_group = QGroupBox("外參設定")
-        settings_layout = QFormLayout(settings_group)
-        settings_layout.setContentsMargins(12, 20, 12, 12)
-        settings_layout.setSpacing(10)
+        # ===== 計算方式選擇 =====
+        method_group = QGroupBox("計算方式")
+        method_layout = QVBoxLayout(method_group)
+        method_layout.setContentsMargins(12, 20, 12, 12)
+
+        self.ext_method_group = QButtonGroup(self)
+
+        # 方式一：使用點位數據
+        self.ext_use_points_radio = QRadioButton("使用點位數據（推薦）")
+        self.ext_use_points_radio.setChecked(True)
+        self.ext_use_points_radio.setToolTip("使用「點位數據」頁籤中的像素-世界座標對應")
+        self.ext_method_group.addButton(self.ext_use_points_radio, 0)
+        method_layout.addWidget(self.ext_use_points_radio)
+
+        self.ext_points_status = QLabel("點位數據：0 個點")
+        self.ext_points_status.setProperty("subheading", True)
+        self.ext_points_status.setStyleSheet("margin-left: 24px;")
+        method_layout.addWidget(self.ext_points_status)
+
+        # 方式二：使用圖像角點
+        self.ext_use_corners_radio = QRadioButton("使用圖像角點")
+        self.ext_use_corners_radio.setToolTip("選擇一張圖像，使用棋盤格角點計算")
+        self.ext_method_group.addButton(self.ext_use_corners_radio, 1)
+        method_layout.addWidget(self.ext_use_corners_radio)
 
         # 圖像選擇下拉選單
+        corners_layout = QHBoxLayout()
+        corners_layout.setContentsMargins(24, 0, 0, 0)
         self.ext_image_combo = QComboBox()
         self.ext_image_combo.setToolTip("選擇要用於外參計算的圖像")
-        self.ext_image_combo.addItem("-- 請先完成內參標定 --")
-        settings_layout.addRow("定位圖像：", self.ext_image_combo)
+        self.ext_image_combo.addItem("-- 請先載入圖像 --")
+        corners_layout.addWidget(QLabel("定位圖像："))
+        corners_layout.addWidget(self.ext_image_combo, 1)
+        method_layout.addLayout(corners_layout)
 
-        # 執行按鈕
+        layout.addWidget(method_group)
+
+        # ===== 算法選擇 =====
+        algo_group = QGroupBox("算法選擇")
+        algo_layout = QVBoxLayout(algo_group)
+        algo_layout.setContentsMargins(12, 20, 12, 12)
+        algo_layout.setSpacing(8)
+
+        algo_select_layout = QFormLayout()
+        self.ext_algo_combo = QComboBox()
+        self.ext_algo_combo.addItem("PnP 迭代法 (≥4點, 推薦)", "SOLVEPNP_ITERATIVE")
+        self.ext_algo_combo.addItem("EPnP 算法 (≥4點, 高效)", "SOLVEPNP_EPNP")
+        self.ext_algo_combo.addItem("P3P 算法 (=3點)", "SOLVEPNP_P3P")
+        self.ext_algo_combo.addItem("AP3P 算法 (≥3點)", "SOLVEPNP_AP3P")
+        self.ext_algo_combo.addItem("IPPE 算法 (≥4點, 平面)", "SOLVEPNP_IPPE")
+        self.ext_algo_combo.addItem("IPPE_SQUARE (≥4點, 正方形)", "SOLVEPNP_IPPE_SQUARE")
+        self.ext_algo_combo.currentIndexChanged.connect(self._on_algo_changed)
+        algo_select_layout.addRow("PnP 算法：", self.ext_algo_combo)
+        algo_layout.addLayout(algo_select_layout)
+
+        # 算法說明
+        self.algo_desc_label = QLabel(
+            "迭代法：最通用，適合大多數情況，需≥4個點"
+        )
+        self.algo_desc_label.setProperty("subheading", True)
+        self.algo_desc_label.setWordWrap(True)
+        self.algo_desc_label.setStyleSheet("color: #5f6368; font-size: 12px;")
+        algo_layout.addWidget(self.algo_desc_label)
+
+        layout.addWidget(algo_group)
+
+        # ===== 執行按鈕 =====
+        btn_layout = QHBoxLayout()
+
         self.ext_calibrate_btn = QPushButton("計算外參")
         self.ext_calibrate_btn.clicked.connect(self._on_calibrate_extrinsic)
-        self.ext_calibrate_btn.setEnabled(False)
-        settings_layout.addRow("", self.ext_calibrate_btn)
+        btn_layout.addWidget(self.ext_calibrate_btn)
 
-        layout.addWidget(settings_group)
+        self.ext_export_btn = QPushButton("匯出外參")
+        self.ext_export_btn.clicked.connect(self._on_export_extrinsic)
+        self.ext_export_btn.setEnabled(False)
+        btn_layout.addWidget(self.ext_export_btn)
 
-        # 結果顯示區
+        layout.addLayout(btn_layout)
+
+        # ===== 結果顯示區 =====
         result_group = QGroupBox("外參結果")
         result_layout = QVBoxLayout(result_group)
         result_layout.setContentsMargins(12, 20, 12, 12)
@@ -396,26 +1038,42 @@ class MainWindow(QMainWindow):
         self.extrinsic_view.setReadOnly(True)
         self.extrinsic_view.setPlaceholderText(
             "外參標定流程：\n\n"
-            "① 先完成內參標定\n"
+            "方式一（推薦）：使用點位數據\n"
+            "① 在「內參標定」完成內參計算或載入\n"
+            "② 在「點位數據」設定像素-世界座標對應\n"
+            "③ 在此頁選擇「使用點位數據」\n"
+            "④ 點擊「計算外參」\n\n"
+            "方式二：使用圖像角點\n"
+            "① 在「內參標定」完成內參計算\n"
             "② 選擇一張圖像定義世界座標系\n"
-            "③ 點擊「計算外參」\n\n"
-            "結果將包含：\n"
-            "• 旋轉向量 / 旋轉矩陣\n"
-            "• 平移向量\n"
-            "• 相機在世界座標系中的位置"
+            "③ 在此頁選擇「使用圖像角點」\n"
+            "④ 點擊「計算外參」"
         )
         result_layout.addWidget(self.extrinsic_view)
 
         layout.addWidget(result_group, 1)
 
-        return widget
+        scroll.setWidget(widget)
+        container_layout.addWidget(scroll)
+
+        return container
 
     def _create_transform_tab(self) -> QWidget:
         """建立座標轉換頁籤"""
         from PySide6.QtWidgets import (
             QTextEdit, QGroupBox, QDoubleSpinBox, QPushButton,
-            QFormLayout, QGridLayout,
+            QFormLayout, QGridLayout, QScrollArea,
         )
+
+        # 外層容器
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 捲動區域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
 
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -523,7 +1181,10 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        return widget
+        scroll.setWidget(widget)
+        container_layout.addWidget(scroll)
+
+        return container
 
     def _setup_menu(self):
         """設置選單列"""
@@ -643,6 +1304,10 @@ class MainWindow(QMainWindow):
 
             self.statusbar.showMessage(f"已載入 {len(files)} 張圖像")
             logger.info(f"載入 {len(files)} 張圖像")
+
+            # 如果已有內參，更新外參圖像下拉選單
+            if self._result is not None:
+                self._update_extrinsic_image_combo()
 
     @Slot()
     def _on_clear_images(self):
@@ -793,6 +1458,10 @@ class MainWindow(QMainWindow):
         self._set_buttons_enabled(True)
         self.statusbar.showMessage(f"角點偵測完成：{success_count}/{total_count} 張成功")
         self._corner_worker = None
+
+        # 如果已有內參數據，更新外參圖像下拉選單
+        if self._result is not None:
+            self._update_extrinsic_image_combo()
 
     @Slot(str)
     def _on_corner_error(self, error_msg: str):
@@ -978,25 +1647,43 @@ class MainWindow(QMainWindow):
                 self._result = CalibrationFile.load(file_path)
                 self._display_calibration_result(self._result)
                 self.export_btn.setEnabled(True)
-                self.statusbar.showMessage(f"已載入：{file_path}")
+                self.statusbar.showMessage(f"已載入內參：{file_path}")
+                logger.info(f"成功載入標定檔案，內參已就緒")
+
+                # 更新外參頁面狀態提示
+                self.ext_image_combo.clear()
+                self.ext_image_combo.addItem("-- 請新增圖像並偵測角點 --")
+                self.ext_calibrate_btn.setEnabled(False)
+
+                # 顯示提示訊息
+                QMessageBox.information(
+                    self,
+                    "載入成功",
+                    "內參已載入！\n\n"
+                    "若要計算外參，請：\n"
+                    "① 新增定位圖像\n"
+                    "② 偵測角點\n"
+                    "③ 切換到「外參計算」頁籤選擇圖像",
+                )
             except Exception as e:
                 QMessageBox.critical(self, "錯誤", f"無法載入檔案：{e}")
+                logger.error(f"載入標定檔案失敗：{e}")
 
     @Slot()
     def _on_about(self):
         """顯示關於對話框"""
         QMessageBox.about(
             self,
-            "關於 Vision Calib",
-            f"""<h2>Vision Calib</h2>
+            "關於 TSIC/CR-ICS01",
+            f"""<h2>TSIC/CR-ICS01</h2>
+            <h3>相機與手臂整合控制教學軟體</h3>
             <p>版本 {__version__}</p>
             <hr>
-            <p>專業相機標定工具</p>
+            <p>專業相機標定與座標轉換工具</p>
             <p>使用棋盤格圖案進行相機內外參標定，<br>
             支援像素、相機、世界座標系之間的轉換。</p>
             <hr>
-            <p><b>授權條款：</b>Apache License 2.0</p>
-            <p><b>原始碼：</b><a href='https://github.com/yourusername/vision-calib'>GitHub</a></p>
+            <p><b>開發單位：</b>TSIC</p>
             """,
         )
 
@@ -1014,64 +1701,196 @@ class MainWindow(QMainWindow):
         """更新外參標定的圖像選擇下拉選單"""
         self.ext_image_combo.clear()
 
-        # 僅列出偵測到角點的圖像
-        valid_images = []
+        # 列出所有已載入的圖像（優先顯示已偵測角點的）
+        all_images = []
         for i in range(self.image_list.count()):
             item = self.image_list.item(i)
             image_path = item.data(Qt.UserRole)
-            if image_path in self._corner_cache and self._corner_cache[image_path] is not None:
-                valid_images.append((Path(image_path).name, image_path))
+            has_corners = image_path in self._corner_cache and self._corner_cache[image_path] is not None
+            all_images.append((Path(image_path).name, image_path, has_corners))
 
-        if not valid_images:
-            self.ext_image_combo.addItem("-- 無有效圖像 --")
+        if not all_images:
+            self.ext_image_combo.addItem("-- 請先新增圖像 --")
             self.ext_calibrate_btn.setEnabled(False)
             return
 
-        for name, path in valid_images:
-            self.ext_image_combo.addItem(name, path)
+        # 先加已偵測角點的，再加未偵測的
+        for name, path, has_corners in all_images:
+            if has_corners:
+                self.ext_image_combo.addItem(f"✓ {name}", path)
+            else:
+                self.ext_image_combo.addItem(f"○ {name} (需偵測)", path)
 
         self.ext_calibrate_btn.setEnabled(True)
-        self.statusbar.showMessage(f"可使用 {len(valid_images)} 張圖像進行外參標定")
+
+        detected_count = sum(1 for _, _, has in all_images if has)
+        self.statusbar.showMessage(f"共 {len(all_images)} 張圖像，{detected_count} 張已偵測角點")
+
+    def _on_algo_changed(self, index: int):
+        """當 PnP 算法選擇變更時更新說明"""
+        algo_descriptions = {
+            "SOLVEPNP_ITERATIVE": "迭代法：最通用，適合大多數情況，需≥4個點",
+            "SOLVEPNP_EPNP": "EPnP：高效率算法，點數較多(>10)時推薦，需≥4個點",
+            "SOLVEPNP_P3P": "P3P：只需剛好3個點，可能有多解，適合點數極少的情況",
+            "SOLVEPNP_AP3P": "AP3P：P3P改進版，數值穩定性更好，需≥3個點",
+            "SOLVEPNP_IPPE": "IPPE：專為平面物體設計，適合棋盤格等平面標定，需≥4個點",
+            "SOLVEPNP_IPPE_SQUARE": "IPPE_SQUARE：IPPE改進版，專為正方形標定板優化，需≥4個點",
+        }
+        algo_data = self.ext_algo_combo.currentData()
+        desc = algo_descriptions.get(algo_data, "")
+        if hasattr(self, 'algo_desc_label'):
+            self.algo_desc_label.setText(desc)
 
     @Slot()
     def _on_calibrate_extrinsic(self):
         """執行外參標定"""
         if self._result is None:
-            QMessageBox.warning(self, "提示", "請先完成內參標定")
+            QMessageBox.warning(
+                self,
+                "尚無內參數據",
+                "請先載入內參標定檔案（.h5/.mat/.json）\n"
+                "或執行內參標定。"
+            )
             return
 
-        # 取得選中的圖像
-        image_path = self.ext_image_combo.currentData()
-        if not image_path:
-            QMessageBox.warning(self, "提示", "請選擇一張定位圖像")
-            return
-
-        # 取得角點
-        corners = self._corner_cache.get(image_path)
-        if corners is None:
-            QMessageBox.warning(self, "錯誤", "該圖像沒有有效的角點資料")
-            return
-
-        from vision_calib.core.extrinsic import ExtrinsicCalibrator
+        import cv2
+        import numpy as np
+        from vision_calib.core.types import CameraExtrinsic
+        from vision_calib.core.extrinsic import ExtrinsicCalibrationResult
         from vision_calib.core.transform import CoordinateTransformer
-        from vision_calib.core.types import CheckerboardConfig
+
+        # 取得 PnP 算法
+        algo_data = self.ext_algo_combo.currentData()
+        algo_flags = {
+            "SOLVEPNP_ITERATIVE": cv2.SOLVEPNP_ITERATIVE,
+            "SOLVEPNP_EPNP": cv2.SOLVEPNP_EPNP,
+            "SOLVEPNP_P3P": cv2.SOLVEPNP_P3P,
+            "SOLVEPNP_AP3P": cv2.SOLVEPNP_AP3P,
+            "SOLVEPNP_IPPE": cv2.SOLVEPNP_IPPE,
+            "SOLVEPNP_IPPE_SQUARE": cv2.SOLVEPNP_IPPE_SQUARE,
+        }
+        pnp_flag = algo_flags.get(algo_data, cv2.SOLVEPNP_ITERATIVE)
+
+        # 確定最少需要的點數
+        min_points = 3 if algo_data in ("SOLVEPNP_P3P", "SOLVEPNP_AP3P") else 4
 
         try:
-            self.statusbar.showMessage("正在計算外參...")
+            # 根據選擇的方式進行計算
+            if self.ext_use_points_radio.isChecked():
+                # 方式一：使用點位數據
+                if len(self._point_data) < min_points:
+                    QMessageBox.warning(
+                        self,
+                        "點位不足",
+                        f"選用的算法至少需要 {min_points} 個點位！\n"
+                        f"目前只有 {len(self._point_data)} 個點位。\n\n"
+                        "請前往「點位數據」頁籤添加點位。"
+                    )
+                    return
 
-            # 建立棋盤格設定
-            checkerboard = CheckerboardConfig(
-                rows=self.rows_spin.value(),
-                cols=self.cols_spin.value(),
-                square_size_mm=self.square_size_spin.value() * 10,  # cm → mm
-            )
+                self.statusbar.showMessage("正在使用點位數據計算外參...")
 
-            # 執行外參標定
-            calibrator = ExtrinsicCalibrator(
-                intrinsic=self._result.intrinsic,
-                checkerboard=checkerboard,
-            )
-            self._extrinsic_result = calibrator.calibrate(image_path, corners)
+                # 從 point_data 提取座標
+                object_points = np.array(
+                    [[p[3], p[4], 0.0] for p in self._point_data],
+                    dtype=np.float32
+                )
+                image_points = np.array(
+                    [[p[1], p[2]] for p in self._point_data],
+                    dtype=np.float32
+                )
+
+                # 執行 solvePnP
+                success, rvec, tvec = cv2.solvePnP(
+                    object_points,
+                    image_points,
+                    self._result.intrinsic.camera_matrix,
+                    self._result.intrinsic.distortion_coeffs,
+                    flags=pnp_flag,
+                )
+
+                if not success:
+                    QMessageBox.critical(self, "失敗", "solvePnP 計算失敗！請檢查點位數據。")
+                    return
+
+                # 計算重投影誤差
+                projected, _ = cv2.projectPoints(
+                    object_points,
+                    rvec,
+                    tvec,
+                    self._result.intrinsic.camera_matrix,
+                    self._result.intrinsic.distortion_coeffs,
+                )
+                projected = projected.reshape(-1, 2)
+                error = np.sqrt(np.mean(np.sum((image_points - projected) ** 2, axis=1)))
+
+                # 建立結果
+                extrinsic = CameraExtrinsic(
+                    rotation_vector=rvec,
+                    translation_vector=tvec,
+                )
+                self._extrinsic_result = ExtrinsicCalibrationResult(
+                    extrinsic=extrinsic,
+                    reprojection_error=error,
+                    image_path="point_data",
+                    num_points=len(self._point_data),
+                )
+
+            else:
+                # 方式二：使用圖像角點
+                image_path = self.ext_image_combo.currentData()
+                if not image_path:
+                    QMessageBox.warning(
+                        self,
+                        "無可用圖像",
+                        "請先新增定位圖像，然後從下拉選單選擇。"
+                    )
+                    return
+
+                # 取得角點
+                corners = self._corner_cache.get(image_path)
+                if corners is None:
+                    # 自動偵測角點
+                    self.statusbar.showMessage("正在偵測角點...")
+                    from vision_calib.core.corner_detector import CornerDetector
+                    from vision_calib.core.types import CheckerboardConfig
+
+                    config = CheckerboardConfig(
+                        rows=self.rows_spin.value(),
+                        cols=self.cols_spin.value(),
+                        square_size_mm=self.square_size_spin.value() * 10,
+                    )
+                    detector = CornerDetector(config)
+                    result = detector.detect(image_path)
+
+                    if not result.success:
+                        QMessageBox.warning(
+                            self,
+                            "角點偵測失敗",
+                            f"無法偵測到 {self.cols_spin.value()}×{self.rows_spin.value()} 棋盤格角點。"
+                        )
+                        return
+
+                    corners = result.corners
+                    self._corner_cache[image_path] = corners
+                    self._update_extrinsic_image_combo()
+
+                self.statusbar.showMessage("正在使用圖像角點計算外參...")
+
+                from vision_calib.core.extrinsic import ExtrinsicCalibrator
+                from vision_calib.core.types import CheckerboardConfig
+
+                checkerboard = CheckerboardConfig(
+                    rows=self.rows_spin.value(),
+                    cols=self.cols_spin.value(),
+                    square_size_mm=self.square_size_spin.value() * 10,
+                )
+
+                calibrator = ExtrinsicCalibrator(
+                    intrinsic=self._result.intrinsic,
+                    checkerboard=checkerboard,
+                )
+                self._extrinsic_result = calibrator.calibrate(image_path, corners)
 
             # 建立座標轉換器
             self._transformer = CoordinateTransformer(
@@ -1082,20 +1901,22 @@ class MainWindow(QMainWindow):
             # 顯示結果
             self._display_extrinsic_result()
 
-            # 啟用座標轉換功能
+            # 啟用按鈕
             self._enable_transform_buttons()
+            self.ext_export_btn.setEnabled(True)
 
-            self.statusbar.showMessage("外參標定完成")
+            self.statusbar.showMessage("外參計算完成")
             QMessageBox.information(
                 self,
-                "外參標定完成",
+                "外參計算完成",
                 f"重投影誤差：{self._extrinsic_result.reprojection_error:.4f} 像素\n\n"
+                f"使用點位數：{self._extrinsic_result.num_points}\n"
                 f"現在可以使用座標轉換功能。",
             )
 
         except Exception as e:
-            QMessageBox.critical(self, "錯誤", f"外參標定失敗：{e}")
-            logger.error(f"外參標定失敗：{e}")
+            QMessageBox.critical(self, "錯誤", f"外參計算失敗：{e}")
+            logger.error(f"外參計算失敗：{e}")
 
     def _display_extrinsic_result(self):
         """顯示外參標定結果"""
@@ -1167,13 +1988,377 @@ class MainWindow(QMainWindow):
             self.w2p_result.setText(f"轉換失敗：{e}")
             logger.error(f"世界→像素轉換失敗：{e}")
 
+    # ===== 點位數據管理 =====
+
+    @Slot()
+    def _on_add_point(self):
+        """添加單個點位"""
+        point_id = self.point_id_spin.value()
+        img_x = self.point_img_x_spin.value()
+        img_y = self.point_img_y_spin.value()
+        world_x = self.point_world_x_spin.value()
+        world_y = self.point_world_y_spin.value()
+
+        self._point_data.append([point_id, img_x, img_y, world_x, world_y])
+        self._update_points_table()
+
+        # 自動遞增 ID
+        self.point_id_spin.setValue(point_id + 1)
+        self.statusbar.showMessage(f"已添加點位 {point_id}")
+
+    @Slot()
+    def _on_clear_points(self):
+        """清除所有點位數據"""
+        if self._point_data:
+            reply = QMessageBox.question(
+                self, "確認清除",
+                f"確定要清除所有 {len(self._point_data)} 個點位嗎？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._point_data.clear()
+                self._update_points_table()
+                self.statusbar.showMessage("已清除所有點位")
+
+    def _update_points_table(self):
+        """更新點位數據表格"""
+        from PySide6.QtWidgets import QTableWidgetItem
+
+        self.points_table.setRowCount(len(self._point_data))
+        for i, point in enumerate(self._point_data):
+            for j, val in enumerate(point):
+                item = QTableWidgetItem(f"{val:.2f}" if isinstance(val, float) else str(int(val)))
+                self.points_table.setItem(i, j, item)
+
+        # 更新標題
+        self.points_list_group.setTitle(f"當前點位 (共 {len(self._point_data)} 個)")
+
+        # 更新外參頁面狀態
+        self.ext_points_status.setText(f"點位數據：{len(self._point_data)} 個點")
+
+    @Slot()
+    def _on_import_points_csv(self):
+        """匯入點位 CSV"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "匯入點位數據",
+            "", "CSV 檔案 (*.csv);;所有檔案 (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            import csv
+            with open(file_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                count = 0
+                for row in reader:
+                    # 支持多種欄位名稱
+                    point_id = float(row.get('id', row.get('ID', count + 1)))
+                    img_x = float(row.get('image_x', row.get('img_x', row.get('x', 0))))
+                    img_y = float(row.get('image_y', row.get('img_y', row.get('y', 0))))
+                    world_x = float(row.get('world_x', row.get('X', 0)))
+                    world_y = float(row.get('world_y', row.get('Y', 0)))
+                    self._point_data.append([point_id, img_x, img_y, world_x, world_y])
+                    count += 1
+
+            self._update_points_table()
+            self.statusbar.showMessage(f"已匯入 {count} 個點位")
+            QMessageBox.information(self, "匯入成功", f"已匯入 {count} 個點位")
+        except Exception as e:
+            QMessageBox.critical(self, "匯入失敗", f"無法讀取 CSV：{e}")
+
+    @Slot()
+    def _on_export_points_csv(self):
+        """匯出點位 CSV"""
+        if not self._point_data:
+            QMessageBox.warning(self, "無數據", "目前沒有點位數據可匯出")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "匯出點位數據",
+            "point_data.csv", "CSV 檔案 (*.csv);;所有檔案 (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            import csv
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['id', 'image_x', 'image_y', 'world_x', 'world_y'])
+                for point in self._point_data:
+                    writer.writerow(point)
+
+            self.statusbar.showMessage(f"已匯出至：{file_path}")
+            QMessageBox.information(self, "匯出成功", f"已匯出 {len(self._point_data)} 個點位")
+        except Exception as e:
+            QMessageBox.critical(self, "匯出失敗", f"無法寫入 CSV：{e}")
+
+    @Slot()
+    def _on_load_corners_to_points(self):
+        """從角點快取載入像素座標到點位數據"""
+        # 找到第一個有角點的圖像
+        corners_data = None
+        for path, corners in self._corner_cache.items():
+            if corners is not None:
+                corners_data = corners
+                break
+
+        if corners_data is None:
+            QMessageBox.warning(
+                self, "無角點數據",
+                "請先偵測圖像角點。\n\n"
+                "① 載入圖像\n"
+                "② 設定棋盤格參數\n"
+                "③ 點擊「偵測角點」"
+            )
+            return
+
+        # 如果有世界座標，合併；否則只載入像素座標
+        if self._generated_world_coords:
+            if len(corners_data) != len(self._generated_world_coords):
+                QMessageBox.warning(
+                    self, "數量不匹配",
+                    f"角點數量 ({len(corners_data)}) 與世界座標數量 "
+                    f"({len(self._generated_world_coords)}) 不匹配！\n\n"
+                    "請確保棋盤格參數一致。"
+                )
+                return
+
+            self._point_data.clear()
+            for i, (corner, world) in enumerate(zip(corners_data, self._generated_world_coords)):
+                point_id = world[0]
+                img_x, img_y = corner[0], corner[1]
+                world_x, world_y = world[1], world[2]
+                self._point_data.append([point_id, img_x, img_y, world_x, world_y])
+        else:
+            # 只載入像素座標，世界座標設為 0
+            self._point_data.clear()
+            for i, corner in enumerate(corners_data):
+                self._point_data.append([i + 1, corner[0], corner[1], 0.0, 0.0])
+
+        self._update_points_table()
+        self.statusbar.showMessage(f"已載入 {len(self._point_data)} 個點位")
+        QMessageBox.information(
+            self, "載入成功",
+            f"已載入 {len(self._point_data)} 個點位到數據表。\n\n"
+            + ("已合併世界座標。" if self._generated_world_coords else "世界座標尚未設定，請使用「棋盤生成」功能。")
+        )
+
+    # ===== 棋盤格世界座標生成 =====
+
+    def _get_direction_coeff(self, direction: str) -> tuple:
+        """獲取方向在網格座標系中的係數"""
+        if direction == "image_x_positive":
+            return (1, 0)
+        elif direction == "image_x_negative":
+            return (-1, 0)
+        elif direction == "image_y_positive":
+            return (0, 1)
+        elif direction == "image_y_negative":
+            return (0, -1)
+        return (1, 0)
+
+    @Slot()
+    def _on_generate_world_coords(self):
+        """生成棋盤格世界座標（使用左側全局棋盤格參數）"""
+        try:
+            origin_x = self.origin_x_spin.value()
+            origin_y = self.origin_y_spin.value()
+            grid_x = self.cols_spin.value()  # 使用全局參數
+            grid_y = self.rows_spin.value()  # 使用全局參數
+            spacing = self.square_size_spin.value() * 10  # cm → mm
+            robot_point = self.robot_origin_point_spin.value()
+
+            robot_x_dir = self.robot_x_dir_combo.currentData()
+            robot_y_dir = self.robot_y_dir_combo.currentData()
+
+            total_points = grid_x * grid_y
+            if robot_point < 1 or robot_point > total_points:
+                QMessageBox.warning(
+                    self, "參數錯誤",
+                    f"機械臂原點編號必須在 1 到 {total_points} 之間"
+                )
+                return
+
+            # 計算機械臂原點在棋盤格中的位置
+            robot_idx = robot_point - 1
+            robot_grid_i = robot_idx % grid_x
+            robot_grid_j = robot_idx // grid_x
+
+            # 獲取座標軸方向係數
+            robot_x_coeff = self._get_direction_coeff(robot_x_dir)
+            robot_y_coeff = self._get_direction_coeff(robot_y_dir)
+
+            # 計算行列式
+            det = robot_x_coeff[0] * robot_y_coeff[1] - robot_y_coeff[0] * robot_x_coeff[1]
+            if abs(det) < 1e-10:
+                QMessageBox.warning(self, "參數錯誤", "座標軸方向不能平行！")
+                return
+
+            # 逆矩陣
+            inv_11 = robot_y_coeff[1] / det
+            inv_12 = -robot_y_coeff[0] / det
+            inv_21 = -robot_x_coeff[1] / det
+            inv_22 = robot_x_coeff[0] / det
+
+            # 生成座標
+            self._generated_world_coords.clear()
+            point_id = 1
+            for j in range(grid_y):
+                for i in range(grid_x):
+                    grid_offset_i = i - robot_grid_i
+                    grid_offset_j = j - robot_grid_j
+
+                    robot_x_offset = inv_11 * grid_offset_i + inv_12 * grid_offset_j
+                    robot_y_offset = inv_21 * grid_offset_i + inv_22 * grid_offset_j
+
+                    world_x = origin_x + robot_x_offset * spacing
+                    world_y = origin_y + robot_y_offset * spacing
+
+                    self._generated_world_coords.append([point_id, world_x, world_y])
+                    point_id += 1
+
+            # 顯示結果
+            import numpy as np
+            coords_array = np.array(self._generated_world_coords)
+
+            result_text = f"""座標生成完成！
+
+總計 {len(self._generated_world_coords)} 個點
+
+棋盤格規格: {grid_x} × {grid_y}
+格子間距: {spacing:.2f} mm
+機械臂原點: P{robot_point} = ({origin_x:.1f}, {origin_y:.1f}) mm
+
+座標範圍:
+  X: {coords_array[:, 1].min():.1f} ~ {coords_array[:, 1].max():.1f} mm
+  Y: {coords_array[:, 2].min():.1f} ~ {coords_array[:, 2].max():.1f} mm
+
+關鍵點位:
+  P1: ({self._generated_world_coords[0][1]:.1f}, {self._generated_world_coords[0][2]:.1f}) mm
+  P{robot_point}: ({origin_x:.1f}, {origin_y:.1f}) mm
+  P{total_points}: ({self._generated_world_coords[-1][1]:.1f}, {self._generated_world_coords[-1][2]:.1f}) mm
+"""
+            self.chessboard_gen_result.setText(result_text)
+            self.statusbar.showMessage(f"已生成 {len(self._generated_world_coords)} 個世界座標")
+
+            # 更新可視化
+            self._update_chessboard_vis()
+
+        except Exception as e:
+            QMessageBox.critical(self, "生成失敗", f"生成座標失敗：{e}")
+            logger.error(f"生成世界座標失敗：{e}")
+
+    @Slot()
+    def _on_load_world_coords_to_points(self):
+        """將生成的世界座標載入到點位數據"""
+        if not self._generated_world_coords:
+            QMessageBox.warning(self, "無數據", "請先生成世界座標")
+            return
+
+        # 找到角點數據
+        corners_data = None
+        for path, corners in self._corner_cache.items():
+            if corners is not None:
+                corners_data = corners
+                break
+
+        if corners_data is None:
+            QMessageBox.warning(
+                self, "無角點數據",
+                "請先偵測圖像角點。\n\n"
+                "① 回到「內參標定」頁籤\n"
+                "② 載入圖像\n"
+                "③ 點擊「偵測角點」"
+            )
+            return
+
+        if len(corners_data) != len(self._generated_world_coords):
+            QMessageBox.warning(
+                self, "數量不匹配",
+                f"角點數量 ({len(corners_data)}) 與世界座標數量 "
+                f"({len(self._generated_world_coords)}) 不匹配！\n\n"
+                "請確保棋盤格參數一致。"
+            )
+            return
+
+        # 合併數據
+        self._point_data.clear()
+        for corner, world in zip(corners_data, self._generated_world_coords):
+            point_id = world[0]
+            img_x, img_y = corner[0], corner[1]
+            world_x, world_y = world[1], world[2]
+            self._point_data.append([point_id, img_x, img_y, world_x, world_y])
+
+        self._update_points_table()
+        self.statusbar.showMessage(f"已載入 {len(self._point_data)} 個點位到數據表")
+
+        # 切換到點位數據頁籤
+        self.tab_widget.setCurrentIndex(1)  # 點位數據頁籤
+
+        QMessageBox.information(
+            self, "載入成功",
+            f"已將 {len(self._point_data)} 個點位載入到數據表！\n\n"
+            "現在可以切換到「外參計算」頁籤進行外參計算。"
+        )
+
+    # ===== 匯出外參 =====
+
+    @Slot()
+    def _on_export_extrinsic(self):
+        """匯出外參數據"""
+        if self._extrinsic_result is None:
+            QMessageBox.warning(self, "無數據", "請先完成外參計算")
+            return
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self, "匯出外參",
+            "extrinsic", "NPY 檔案 (*.npy);;JSON 檔案 (*.json);;所有檔案 (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            import numpy as np
+            import json
+
+            ext = self._extrinsic_result.extrinsic
+            rvec = ext.rotation_vector.flatten()
+            tvec = ext.translation_vector.flatten()
+
+            if file_path.endswith('.npy'):
+                # 儲存為結構化陣列
+                data = {
+                    'rvec': ext.rotation_vector,
+                    'tvec': ext.translation_vector,
+                    'rotation_matrix': ext.rotation_matrix,
+                }
+                np.save(file_path, data)
+            else:
+                # 儲存為 JSON
+                data = {
+                    'rvec': rvec.tolist(),
+                    'tvec': tvec.tolist(),
+                    'rotation_matrix': ext.rotation_matrix.tolist(),
+                    'reprojection_error': self._extrinsic_result.reprojection_error,
+                }
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+
+            self.statusbar.showMessage(f"已匯出至：{file_path}")
+            QMessageBox.information(self, "匯出成功", f"外參已儲存至：\n{file_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "匯出失敗", f"無法儲存檔案：{e}")
+
 
 def main():
     """應用程式入口點"""
     setup_logging()
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Vision Calib")
+    app.setApplicationName("TSIC/CR-ICS01")
     app.setApplicationVersion(__version__)
 
     # 設置預設字型
