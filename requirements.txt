@@ -1,0 +1,13 @@
+# vision-calib dependencies
+# Install with: pip install -r requirements.txt
+
+# Core
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# GUI
+PySide6>=6.5.0
+
+# File formats
+h5py>=3.9.0
+scipy>=1.11.0

@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vision-calib"
+version = "1.0.0"
+description = "Professional camera calibration toolkit using checkerboard patterns"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "vision-calib contributors"}
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+keywords = [
+    "camera",
+    "calibration",
+    "computer-vision",
+    "opencv",
+    "checkerboard",
+    "intrinsic",
+    "extrinsic",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "PySide6>=6.5.0",
+    "h5py>=3.9.0",
+    "scipy>=1.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-qt>=4.2.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/vision-calib"
+Documentation = "https://github.com/yourusername/vision-calib#readme"
+Repository = "https://github.com/yourusername/vision-calib"
+Issues = "https://github.com/yourusername/vision-calib/issues"
+
+[project.gui-scripts]
+vision-calib = "vision_calib.ui.main_window:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"vision_calib.ui.resources" = ["icons/*", "styles/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
