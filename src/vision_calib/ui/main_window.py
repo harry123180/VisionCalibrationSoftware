@@ -986,6 +986,39 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(method_group)
 
+        # ===== Excel 數據管理 =====
+        excel_group = QGroupBox("Excel 數據管理")
+        excel_layout = QVBoxLayout(excel_group)
+        excel_layout.setContentsMargins(12, 20, 12, 12)
+        excel_layout.setSpacing(8)
+
+        excel_desc = QLabel("匯出範本填入視覺座標與機械臂座標，再匯入計算外參")
+        excel_desc.setProperty("subheading", True)
+        excel_desc.setWordWrap(True)
+        excel_layout.addWidget(excel_desc)
+
+        excel_btn_layout = QHBoxLayout()
+        excel_btn_layout.setSpacing(8)
+
+        self.ext_export_template_btn = QPushButton("匯出Excel範本")
+        self.ext_export_template_btn.setToolTip("匯出空白Excel範本，包含像素座標和機械臂座標欄位")
+        self.ext_export_template_btn.clicked.connect(self._on_export_excel_template)
+        excel_btn_layout.addWidget(self.ext_export_template_btn)
+
+        self.ext_import_excel_btn = QPushButton("匯入Excel數據")
+        self.ext_import_excel_btn.setToolTip("匯入填寫好的Excel數據")
+        self.ext_import_excel_btn.clicked.connect(self._on_import_excel_data)
+        excel_btn_layout.addWidget(self.ext_import_excel_btn)
+
+        excel_layout.addLayout(excel_btn_layout)
+
+        self.excel_data_status = QLabel("尚未匯入Excel數據")
+        self.excel_data_status.setProperty("subheading", True)
+        self.excel_data_status.setStyleSheet("margin-top: 4px;")
+        excel_layout.addWidget(self.excel_data_status)
+
+        layout.addWidget(excel_group)
+
         # ===== 算法選擇 =====
         algo_group = QGroupBox("算法選擇")
         algo_layout = QVBoxLayout(algo_group)
@@ -1653,7 +1686,11 @@ class MainWindow(QMainWindow):
                 # 更新外參頁面狀態提示
                 self.ext_image_combo.clear()
                 self.ext_image_combo.addItem("-- 請新增圖像並偵測角點 --")
-                self.ext_calibrate_btn.setEnabled(False)
+                # 如果已有點位數據，保持按鈕啟用；否則禁用
+                if len(self._point_data) >= 3:
+                    self.ext_calibrate_btn.setEnabled(True)
+                else:
+                    self.ext_calibrate_btn.setEnabled(False)
 
                 # 顯示提示訊息
                 QMessageBox.information(
@@ -2036,6 +2073,10 @@ class MainWindow(QMainWindow):
         # 更新外參頁面狀態
         self.ext_points_status.setText(f"點位數據：{len(self._point_data)} 個點")
 
+        # 如果有足夠點位且有內參數據，啟用計算外參按鈕
+        if len(self._point_data) >= 3 and self._result is not None:
+            self.ext_calibrate_btn.setEnabled(True)
+
     @Slot()
     def _on_import_points_csv(self):
         """匯入點位 CSV"""
@@ -2093,6 +2134,218 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "匯出成功", f"已匯出 {len(self._point_data)} 個點位")
         except Exception as e:
             QMessageBox.critical(self, "匯出失敗", f"無法寫入 CSV：{e}")
+
+    @Slot()
+    def _on_export_excel_template(self):
+        """匯出外參計算用的 Excel 範本"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "匯出Excel範本",
+            "extrinsic_calibration_template.xlsx",
+            "Excel 檔案 (*.xlsx);;所有檔案 (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "標定數據"
+
+            # 定義樣式
+            header_font = Font(bold=True, size=12, color="FFFFFF")
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            header_alignment = Alignment(horizontal="center", vertical="center")
+            thin_border = Border(
+                left=Side(style='thin'),
+                right=Side(style='thin'),
+                top=Side(style='thin'),
+                bottom=Side(style='thin')
+            )
+
+            # 表頭
+            headers = [
+                ("ID", "點位編號"),
+                ("視覺X (像素)", "視覺辨識的X座標（像素）"),
+                ("視覺Y (像素)", "視覺辨識的Y座標（像素）"),
+                ("機械臂X (mm)", "機械臂座標系的X座標（毫米）"),
+                ("機械臂Y (mm)", "機械臂座標系的Y座標（毫米）"),
+            ]
+
+            # 寫入表頭
+            for col, (header, _) in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col, value=header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_alignment
+                cell.border = thin_border
+
+            # 設置欄寬
+            col_widths = [8, 18, 18, 18, 18]
+            for col, width in enumerate(col_widths, 1):
+                ws.column_dimensions[get_column_letter(col)].width = width
+
+            # 添加範例數據行（可選，作為填寫示範）
+            example_data = [
+                [1, "", "", "", ""],
+                [2, "", "", "", ""],
+                [3, "", "", "", ""],
+                [4, "", "", "", ""],
+                [5, "", "", "", ""],
+                [6, "", "", "", ""],
+                [7, "", "", "", ""],
+                [8, "", "", "", ""],
+                [9, "", "", "", ""],
+                [10, "", "", "", ""],
+            ]
+
+            data_alignment = Alignment(horizontal="center", vertical="center")
+            for row_idx, row_data in enumerate(example_data, 2):
+                for col_idx, value in enumerate(row_data, 1):
+                    cell = ws.cell(row=row_idx, column=col_idx, value=value if value != "" else None)
+                    cell.alignment = data_alignment
+                    cell.border = thin_border
+
+            # 添加說明工作表
+            ws_info = wb.create_sheet("使用說明")
+            instructions = [
+                ["外參計算 Excel 範本使用說明"],
+                [""],
+                ["1. 在「標定數據」工作表中填入對應點位的座標數據"],
+                ["2. 視覺X/Y：在圖像中辨識到的點位像素座標"],
+                ["3. 機械臂X/Y：機械臂移動到該點位時的座標（毫米）"],
+                ["4. 至少需要 4 個點位才能計算外參"],
+                ["5. 點位數量越多，計算結果越準確"],
+                [""],
+                ["注意事項："],
+                ["- 確保視覺座標與機械臂座標一一對應"],
+                ["- 點位應盡量分布在視野的不同區域"],
+                ["- 避免所有點位在一條直線上"],
+            ]
+            for row_idx, row in enumerate(instructions, 1):
+                cell = ws_info.cell(row=row_idx, column=1, value=row[0] if row else "")
+                if row_idx == 1:
+                    cell.font = Font(bold=True, size=14)
+
+            ws_info.column_dimensions['A'].width = 60
+
+            wb.save(file_path)
+            self.statusbar.showMessage(f"已匯出Excel範本：{file_path}")
+            QMessageBox.information(
+                self, "匯出成功",
+                f"已匯出Excel範本至：\n{file_path}\n\n"
+                "請在「標定數據」工作表中填入座標數據後匯入。"
+            )
+
+        except ImportError:
+            QMessageBox.critical(
+                self, "缺少依賴",
+                "需要安裝 openpyxl 套件：\npip install openpyxl"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "匯出失敗", f"無法建立Excel檔案：{e}")
+
+    @Slot()
+    def _on_import_excel_data(self):
+        """匯入 Excel 數據用於外參計算"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "匯入Excel數據",
+            "", "Excel 檔案 (*.xlsx *.xls);;所有檔案 (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            from openpyxl import load_workbook
+
+            wb = load_workbook(file_path, data_only=True)
+
+            # 尋找數據工作表（優先「標定數據」，否則使用第一個）
+            if "標定數據" in wb.sheetnames:
+                ws = wb["標定數據"]
+            else:
+                ws = wb.active
+
+            # 讀取數據（跳過表頭）
+            imported_data = []
+            valid_count = 0
+            skip_count = 0
+
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
+                if row is None or all(cell is None for cell in row):
+                    continue
+
+                try:
+                    # 嘗試讀取各欄位
+                    point_id = row[0] if row[0] is not None else row_idx - 1
+                    img_x = row[1] if len(row) > 1 and row[1] is not None else None
+                    img_y = row[2] if len(row) > 2 and row[2] is not None else None
+                    world_x = row[3] if len(row) > 3 and row[3] is not None else None
+                    world_y = row[4] if len(row) > 4 and row[4] is not None else None
+
+                    # 檢查必要欄位是否有值
+                    if img_x is None or img_y is None or world_x is None or world_y is None:
+                        skip_count += 1
+                        continue
+
+                    # 轉換為數值
+                    imported_data.append([
+                        float(point_id),
+                        float(img_x),
+                        float(img_y),
+                        float(world_x),
+                        float(world_y)
+                    ])
+                    valid_count += 1
+
+                except (ValueError, TypeError) as e:
+                    skip_count += 1
+                    continue
+
+            wb.close()
+
+            if not imported_data:
+                QMessageBox.warning(
+                    self, "無有效數據",
+                    "Excel檔案中沒有找到有效的座標數據。\n\n"
+                    "請確認：\n"
+                    "1. 數據填寫在「標定數據」工作表\n"
+                    "2. 視覺座標和機械臂座標都已填寫\n"
+                    "3. 座標值為數字格式"
+                )
+                return
+
+            # 更新點位數據
+            self._point_data = imported_data
+            self._update_points_table()
+
+            # 更新外參計算頁籤的狀態
+            self.excel_data_status.setText(f"已匯入 {valid_count} 個點位")
+            self.ext_points_status.setText(f"點位數據：{valid_count} 個點")
+
+            # 自動切換到使用點位數據模式
+            self.ext_use_points_radio.setChecked(True)
+
+            # 啟用計算外參按鈕
+            self.ext_calibrate_btn.setEnabled(True)
+
+            msg = f"已成功匯入 {valid_count} 個點位"
+            if skip_count > 0:
+                msg += f"\n（跳過 {skip_count} 個無效行）"
+
+            self.statusbar.showMessage(msg)
+            QMessageBox.information(self, "匯入成功", msg + "\n\n現在可以點擊「計算外參」進行計算。")
+
+        except ImportError:
+            QMessageBox.critical(
+                self, "缺少依賴",
+                "需要安裝 openpyxl 套件：\npip install openpyxl"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "匯入失敗", f"無法讀取Excel檔案：{e}")
 
     @Slot()
     def _on_load_corners_to_points(self):
