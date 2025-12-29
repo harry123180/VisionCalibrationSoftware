@@ -11,8 +11,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QSize, Signal, Slot
-from PySide6.QtGui import QAction, QIcon, QFont
+from PySide6.QtCore import Qt, QSize, Signal, Slot, QThread, QMutex, QMutexLocker
+from PySide6.QtGui import QAction, QIcon, QFont, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -39,6 +39,394 @@ from vision_calib.ui.styles.theme import Theme, ThemeManager
 from vision_calib.utils.logging import get_logger, setup_logging
 
 logger = get_logger("ui.main_window")
+
+
+class ImageViewer(QLabel):
+    """
+    支持縮放、拖曳、標記點的圖像查看器
+
+    功能：
+    - 左鍵點擊：新增標記點 / 選中現有點
+    - 右鍵拖曳：平移圖像
+    - 滾輪：縮放
+    - 雙擊：重置視圖
+    """
+
+    point_added = Signal(float, float)  # 新增點 (image_x, image_y)
+    point_selected = Signal(int)  # 選中點 (index)
+    mouse_moved = Signal(float, float)  # 滑鼠移動 (image_x, image_y)
+    mouse_left = Signal()  # 滑鼠離開
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(640, 480)
+        self.setMouseTracking(True)
+        self.setStyleSheet("""
+            ImageViewer {
+                background-color: #1a1a1a;
+                border: 1px solid #404040;
+                border-radius: 4px;
+            }
+        """)
+        self.setText("請選擇相機並點擊「開始串流」")
+
+        # 圖像數據
+        self._pixmap = None  # 原始圖像
+        self._image_width = 0
+        self._image_height = 0
+
+        # 視圖變換
+        self._scale = 1.0
+        self._offset_x = 0.0
+        self._offset_y = 0.0
+        self._min_scale = 0.1
+        self._max_scale = 10.0
+
+        # 拖曳狀態
+        self._dragging = False
+        self._drag_start = None
+        self._drag_offset_start = None
+
+        # 標記點
+        self._points = []  # [{name, x, y}, ...]
+        self._point_radius = 15  # 點擊檢測半徑
+
+        # 模式
+        self._interactive = False  # 是否允許交互（拍照後才允許）
+
+    def set_image(self, pixmap, interactive: bool = False):
+        """設置要顯示的圖像"""
+        from PySide6.QtGui import QPixmap
+        self._pixmap = pixmap
+        if pixmap:
+            self._image_width = pixmap.width()
+            self._image_height = pixmap.height()
+        self._interactive = interactive
+        self._update_display()
+
+    def set_points(self, points: list):
+        """設置標記點列表"""
+        self._points = points
+        self._update_display()
+
+    def reset_view(self):
+        """重置視圖（適應窗口）"""
+        self._scale = 1.0
+        self._offset_x = 0.0
+        self._offset_y = 0.0
+        self._update_display()
+
+    def _update_display(self):
+        """更新顯示"""
+        from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
+
+        if self._pixmap is None:
+            return
+
+        # 計算適應窗口的基礎縮放
+        label_w, label_h = self.width(), self.height()
+        if label_w <= 0 or label_h <= 0:
+            return
+
+        base_scale = min(label_w / self._image_width, label_h / self._image_height)
+        total_scale = base_scale * self._scale
+
+        # 計算縮放後的尺寸
+        scaled_w = int(self._image_width * total_scale)
+        scaled_h = int(self._image_height * total_scale)
+
+        # 創建顯示用的 pixmap
+        display = QPixmap(label_w, label_h)
+        display.fill(QColor("#1a1a1a"))
+
+        painter = QPainter(display)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        # 計算繪製位置（居中 + 偏移）
+        draw_x = (label_w - scaled_w) / 2 + self._offset_x
+        draw_y = (label_h - scaled_h) / 2 + self._offset_y
+
+        # 繪製圖像
+        painter.drawPixmap(
+            int(draw_x), int(draw_y), scaled_w, scaled_h,
+            self._pixmap
+        )
+
+        # 繪製標記點
+        if self._interactive and self._points:
+            for i, point in enumerate(self._points):
+                # 轉換圖像座標到顯示座標
+                px = draw_x + point['pixel_x'] * total_scale
+                py = draw_y + point['pixel_y'] * total_scale
+
+                # 繪製十字線
+                pen = QPen(QColor(255, 50, 50), 2)
+                painter.setPen(pen)
+                cross_size = 12
+                painter.drawLine(int(px - cross_size), int(py), int(px + cross_size), int(py))
+                painter.drawLine(int(px), int(py - cross_size), int(px), int(py + cross_size))
+
+                # 繪製圓圈
+                painter.drawEllipse(int(px - 8), int(py - 8), 16, 16)
+
+                # 繪製標籤
+                painter.setFont(QFont("Arial", 11, QFont.Bold))
+                painter.setPen(QPen(QColor(255, 255, 0)))
+                painter.drawText(int(px + 12), int(py - 5), point['name'])
+
+        painter.end()
+        super().setPixmap(display)
+
+    def _display_to_image_coords(self, display_x: float, display_y: float):
+        """將顯示座標轉換為圖像座標"""
+        if self._pixmap is None or self._image_width == 0:
+            return None, None
+
+        label_w, label_h = self.width(), self.height()
+        base_scale = min(label_w / self._image_width, label_h / self._image_height)
+        total_scale = base_scale * self._scale
+
+        scaled_w = self._image_width * total_scale
+        scaled_h = self._image_height * total_scale
+
+        draw_x = (label_w - scaled_w) / 2 + self._offset_x
+        draw_y = (label_h - scaled_h) / 2 + self._offset_y
+
+        img_x = (display_x - draw_x) / total_scale
+        img_y = (display_y - draw_y) / total_scale
+
+        if 0 <= img_x < self._image_width and 0 <= img_y < self._image_height:
+            return img_x, img_y
+        return None, None
+
+    def _find_point_at(self, img_x: float, img_y: float):
+        """查找指定位置附近的點，返回索引或 -1"""
+        import math
+        for i, point in enumerate(self._points):
+            dist = math.sqrt((img_x - point['pixel_x'])**2 + (img_y - point['pixel_y'])**2)
+            if dist < self._point_radius:
+                return i
+        return -1
+
+    def mousePressEvent(self, event):
+        """滑鼠按下"""
+        if event.button() == Qt.RightButton:
+            # 右鍵開始拖曳
+            self._dragging = True
+            self._drag_start = event.pos()
+            self._drag_offset_start = (self._offset_x, self._offset_y)
+            self.setCursor(Qt.ClosedHandCursor)
+        elif event.button() == Qt.LeftButton and self._interactive:
+            # 左鍵點擊標記點
+            img_x, img_y = self._display_to_image_coords(event.pos().x(), event.pos().y())
+            if img_x is not None:
+                # 檢查是否點擊了現有點
+                point_idx = self._find_point_at(img_x, img_y)
+                if point_idx >= 0:
+                    self.point_selected.emit(point_idx)
+                else:
+                    self.point_added.emit(img_x, img_y)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """滑鼠釋放"""
+        if event.button() == Qt.RightButton:
+            self._dragging = False
+            self.setCursor(Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """滑鼠移動"""
+        if self._dragging and self._drag_start:
+            # 拖曳中
+            delta = event.pos() - self._drag_start
+            self._offset_x = self._drag_offset_start[0] + delta.x()
+            self._offset_y = self._drag_offset_start[1] + delta.y()
+            self._update_display()
+        elif self._interactive:
+            # 顯示座標
+            img_x, img_y = self._display_to_image_coords(event.pos().x(), event.pos().y())
+            if img_x is not None:
+                self.mouse_moved.emit(img_x, img_y)
+            else:
+                self.mouse_left.emit()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        """滑鼠離開"""
+        self.mouse_left.emit()
+        super().leaveEvent(event)
+
+    def wheelEvent(self, event):
+        """滾輪縮放（以滑鼠位置為中心）"""
+        if self._pixmap is None:
+            return
+
+        # 獲取滾輪方向
+        delta = event.angleDelta().y()
+        factor = 1.15 if delta > 0 else 1 / 1.15
+
+        # 計算新縮放
+        old_scale = self._scale
+        new_scale = self._scale * factor
+        new_scale = max(self._min_scale, min(self._max_scale, new_scale))
+
+        if new_scale != old_scale:
+            # 獲取滑鼠位置
+            mouse_x = event.position().x()
+            mouse_y = event.position().y()
+
+            # 計算當前圖像中心位置
+            label_w, label_h = self.width(), self.height()
+            base_scale = min(label_w / self._image_width, label_h / self._image_height)
+
+            # 縮放前的圖像繪製位置
+            old_total_scale = base_scale * old_scale
+            old_scaled_w = self._image_width * old_total_scale
+            old_scaled_h = self._image_height * old_total_scale
+            old_draw_x = (label_w - old_scaled_w) / 2 + self._offset_x
+            old_draw_y = (label_h - old_scaled_h) / 2 + self._offset_y
+
+            # 滑鼠位置對應的圖像座標
+            img_x = (mouse_x - old_draw_x) / old_total_scale
+            img_y = (mouse_y - old_draw_y) / old_total_scale
+
+            # 應用新縮放
+            self._scale = new_scale
+            new_total_scale = base_scale * new_scale
+            new_scaled_w = self._image_width * new_total_scale
+            new_scaled_h = self._image_height * new_total_scale
+
+            # 計算新的繪製位置（使同一圖像點保持在滑鼠位置）
+            new_draw_x = mouse_x - img_x * new_total_scale
+            new_draw_y = mouse_y - img_y * new_total_scale
+
+            # 更新偏移
+            self._offset_x = new_draw_x - (label_w - new_scaled_w) / 2
+            self._offset_y = new_draw_y - (label_h - new_scaled_h) / 2
+
+            self._update_display()
+
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        """雙擊重置視圖"""
+        self.reset_view()
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event):
+        """視窗大小改變時重新繪製"""
+        super().resizeEvent(event)
+        self._update_display()
+
+
+class WebCamWorker(QThread):
+    """
+    背景執行緒處理 WebCAM 影像擷取
+
+    架構：
+    - Signal 只傳輕量 QImage（預覽用）
+    - 原始幀通過 get_frame() 獲取（線程安全）
+    - 主執行緒零 CPU 負擔
+    """
+
+    preview_ready = Signal(QImage)  # 只傳預覽圖，不傳原始幀
+    resolution_ready = Signal(int, int)
+    error = Signal(str)
+
+    def __init__(self, cam_index: int, parent=None):
+        super().__init__(parent)
+        self._cam_index = cam_index
+        self._running = False
+        self._cap = None
+        self._frame_lock = QMutex()
+        self._latest_frame = None  # BGR 原始幀
+        self._frame_width = 0
+        self._frame_height = 0
+
+    def get_frame(self):
+        """線程安全地獲取最新原始幀（用於拍照）"""
+        with QMutexLocker(self._frame_lock):
+            if self._latest_frame is not None:
+                return self._latest_frame.copy(), self._frame_width, self._frame_height
+            return None, 0, 0
+
+    def run(self):
+        """執行緒主迴圈"""
+        import cv2
+        import time
+        import numpy as np
+
+        # 開啟相機
+        self._cap = cv2.VideoCapture(self._cam_index, cv2.CAP_DSHOW)
+        if not self._cap.isOpened():
+            self.error.emit(f"無法開啟相機 {self._cam_index}")
+            return
+
+        # 設置最高解析度
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # 獲取實際解析度
+        self._frame_width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._frame_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.resolution_ready.emit(self._frame_width, self._frame_height)
+
+        # 幀率控制（15 FPS 預覽足夠，降低 CPU 負擔）
+        frame_interval = 1.0 / 15
+        last_emit_time = 0
+
+        # 預先計算縮放參數
+        preview_w = 640
+        scale = preview_w / self._frame_width
+        preview_h = int(self._frame_height * scale)
+
+        self._running = True
+
+        while self._running:
+            ret, frame = self._cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+
+            # 保存原始幀（線程安全）
+            with QMutexLocker(self._frame_lock):
+                self._latest_frame = frame
+
+            # 幀率控制
+            current_time = time.time()
+            if current_time - last_emit_time < frame_interval:
+                time.sleep(0.001)  # 避免忙等待
+                continue
+            last_emit_time = current_time
+
+            # 快速縮放（使用 INTER_NEAREST 最快）
+            small = cv2.resize(frame, (preview_w, preview_h), interpolation=cv2.INTER_NEAREST)
+
+            # BGR 轉 RGB（使用 numpy 切片比 cvtColor 快）
+            rgb = small[:, :, ::-1].copy()
+
+            # 創建 QImage（使用 copy() 確保數據獨立）
+            q_img = QImage(
+                rgb.data,
+                preview_w, preview_h,
+                3 * preview_w,
+                QImage.Format_RGB888
+            ).copy()
+
+            self.preview_ready.emit(q_img)
+
+        # 清理
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    def stop(self):
+        """停止執行緒"""
+        self._running = False
+        self.wait(2000)
 
 
 class MainWindow(QMainWindow):
@@ -75,6 +463,9 @@ class MainWindow(QMainWindow):
 
         # 生成的世界座標
         self._generated_world_coords: list = []
+
+        # WebCAM 標記點 [{name, pixel_x, pixel_y, world_x, world_y}, ...]
+        self._marked_points: list = []
 
         # 設置 UI
         self._setup_ui()
@@ -173,14 +564,12 @@ class MainWindow(QMainWindow):
         self.cols_spin.setRange(2, 50)
         self.cols_spin.setValue(17)
         self.cols_spin.setToolTip("棋盤格內部角點的水平數量（與原工具「寬度」相同）")
-        self.cols_spin.valueChanged.connect(self._on_global_param_changed)
         cb_layout.addRow("寬度(角點數)：", self.cols_spin)
 
         self.rows_spin = QSpinBox()
         self.rows_spin.setRange(2, 50)
         self.rows_spin.setValue(12)
         self.rows_spin.setToolTip("棋盤格內部角點的垂直數量（與原工具「高度」相同）")
-        self.rows_spin.valueChanged.connect(self._on_global_param_changed)
         cb_layout.addRow("高度(角點數)：", self.rows_spin)
 
         self.square_size_spin = QDoubleSpinBox()
@@ -189,7 +578,6 @@ class MainWindow(QMainWindow):
         self.square_size_spin.setDecimals(2)
         self.square_size_spin.setSuffix(" cm")
         self.square_size_spin.setToolTip("棋盤格每個方格的實際邊長（公分）")
-        self.square_size_spin.valueChanged.connect(self._on_global_param_changed)
         cb_layout.addRow("方格邊長：", self.square_size_spin)
 
         layout.addWidget(cb_group)
@@ -268,14 +656,790 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.tab_widget = QTabWidget()
+        self.tab_widget.addTab(self._create_webcam_tab(), "WebCAM")
         self.tab_widget.addTab(self._create_intrinsic_tab(), "內參標定")
         self.tab_widget.addTab(self._create_points_tab(), "點位數據")
-        self.tab_widget.addTab(self._create_chessboard_gen_tab(), "棋盤生成")
         self.tab_widget.addTab(self._create_extrinsic_tab(), "外參計算")
         self.tab_widget.addTab(self._create_transform_tab(), "座標轉換")
 
         layout.addWidget(self.tab_widget)
         return panel
+
+    def _create_webcam_tab(self) -> QWidget:
+        """建立 WebCAM 頁籤"""
+        from PySide6.QtWidgets import (
+            QGroupBox, QPushButton, QComboBox, QFormLayout, QTableWidget,
+            QTableWidgetItem, QHeaderView,
+        )
+        from PySide6.QtCore import QTimer
+
+        container = QWidget()
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
+
+        # ========== 上方：控制區 ==========
+        ctrl_container = QWidget()
+        ctrl_layout = QHBoxLayout(ctrl_container)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_layout.setSpacing(16)
+
+        # --- 相機選擇 ---
+        cam_group = QGroupBox("相機選擇")
+        cam_layout = QFormLayout(cam_group)
+        cam_layout.setContentsMargins(12, 16, 12, 12)
+        cam_layout.setSpacing(8)
+
+        cam_select_layout = QHBoxLayout()
+        cam_select_layout.setSpacing(8)
+
+        self.cam_combo = QComboBox()
+        self.cam_combo.setMinimumWidth(200)
+        self.cam_combo.setToolTip("選擇要使用的相機裝置")
+        cam_select_layout.addWidget(self.cam_combo)
+
+        self.refresh_cam_btn = QPushButton("掃描")
+        self.refresh_cam_btn.setFixedWidth(80)
+        self.refresh_cam_btn.clicked.connect(self._scan_cameras)
+        self.refresh_cam_btn.setToolTip("重新掃描可用的相機裝置")
+        cam_select_layout.addWidget(self.refresh_cam_btn)
+
+        cam_layout.addRow("裝置：", cam_select_layout)
+        ctrl_layout.addWidget(cam_group)
+
+        # --- 串流控制 ---
+        stream_group = QGroupBox("串流控制")
+        stream_layout = QHBoxLayout(stream_group)
+        stream_layout.setContentsMargins(12, 16, 12, 12)
+        stream_layout.setSpacing(8)
+
+        self.start_stream_btn = QPushButton("開始串流")
+        self.start_stream_btn.clicked.connect(self._start_stream)
+        self.start_stream_btn.setToolTip("開始接收相機影像")
+        stream_layout.addWidget(self.start_stream_btn)
+
+        self.stop_stream_btn = QPushButton("停止串流")
+        self.stop_stream_btn.clicked.connect(self._stop_stream)
+        self.stop_stream_btn.setEnabled(False)
+        self.stop_stream_btn.setProperty("secondary", True)
+        self.stop_stream_btn.setToolTip("停止接收相機影像")
+        stream_layout.addWidget(self.stop_stream_btn)
+
+        ctrl_layout.addWidget(stream_group)
+
+        # --- 拍照控制 ---
+        capture_group = QGroupBox("拍照")
+        capture_layout = QHBoxLayout(capture_group)
+        capture_layout.setContentsMargins(12, 16, 12, 12)
+        capture_layout.setSpacing(8)
+
+        self.capture_btn = QPushButton("拍照")
+        self.capture_btn.clicked.connect(self._capture_photo)
+        self.capture_btn.setEnabled(False)
+        self.capture_btn.setToolTip("擷取當前畫面並暫停串流")
+        capture_layout.addWidget(self.capture_btn)
+
+        self.resume_btn = QPushButton("繼續串流")
+        self.resume_btn.clicked.connect(self._resume_stream)
+        self.resume_btn.setEnabled(False)
+        self.resume_btn.setProperty("secondary", True)
+        self.resume_btn.setToolTip("繼續接收相機影像")
+        capture_layout.addWidget(self.resume_btn)
+
+        self.save_photo_btn = QPushButton("儲存照片")
+        self.save_photo_btn.clicked.connect(self._save_captured_photo)
+        self.save_photo_btn.setEnabled(False)
+        self.save_photo_btn.setProperty("secondary", True)
+        self.save_photo_btn.setToolTip("將拍攝的照片儲存到檔案")
+        capture_layout.addWidget(self.save_photo_btn)
+
+        ctrl_layout.addWidget(capture_group)
+        ctrl_layout.addStretch()
+
+        main_layout.addWidget(ctrl_container)
+
+        # ========== 中央：左右分割 - 影像 + 標記點列表 ==========
+        center_splitter = QSplitter(Qt.Horizontal)
+
+        # --- 左側：影像顯示區 ---
+        image_container = QWidget()
+        image_layout = QVBoxLayout(image_container)
+        image_layout.setContentsMargins(0, 0, 0, 0)
+        image_layout.setSpacing(4)
+
+        # 使用自定義的 ImageViewer（支持縮放、拖曳）
+        self.image_viewer = ImageViewer()
+        self.image_viewer.point_added.connect(self._on_point_added)
+        self.image_viewer.point_selected.connect(self._on_point_selected)
+        self.image_viewer.mouse_moved.connect(self._on_viewer_mouse_moved)
+        self.image_viewer.mouse_left.connect(self._on_viewer_mouse_left)
+        image_layout.addWidget(self.image_viewer, 1)
+
+        # 座標顯示列
+        coord_layout = QHBoxLayout()
+        self.webcam_status = QLabel("尚未連接相機")
+        self.webcam_status.setProperty("subheading", True)
+        coord_layout.addWidget(self.webcam_status)
+        coord_layout.addStretch()
+
+        self.webcam_coord_label = QLabel("")
+        self.webcam_coord_label.setProperty("subheading", True)
+        self.webcam_coord_label.setStyleSheet("color: #1a73e8; font-weight: bold;")
+        coord_layout.addWidget(self.webcam_coord_label)
+
+        self.webcam_resolution = QLabel("")
+        self.webcam_resolution.setProperty("subheading", True)
+        coord_layout.addWidget(self.webcam_resolution)
+
+        image_layout.addLayout(coord_layout)
+
+        center_splitter.addWidget(image_container)
+
+        # --- 右側：標記點列表 ---
+        points_container = QWidget()
+        points_layout = QVBoxLayout(points_container)
+        points_layout.setContentsMargins(0, 0, 0, 0)
+        points_layout.setSpacing(8)
+
+        points_header = QLabel("標記點 (點擊圖片新增)")
+        points_header.setProperty("subheading", True)
+        points_header.setStyleSheet("font-weight: bold;")
+        points_layout.addWidget(points_header)
+
+        self.marked_points_table = QTableWidget()
+        self.marked_points_table.setColumnCount(3)
+        self.marked_points_table.setHorizontalHeaderLabels(["名稱", "X (px)", "Y (px)"])
+        self.marked_points_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.marked_points_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.marked_points_table.setSelectionMode(QTableWidget.SingleSelection)
+        # 允許雙擊編輯（只有名稱欄位可編輯）
+        self.marked_points_table.setEditTriggers(QTableWidget.DoubleClicked)
+        self.marked_points_table.cellChanged.connect(self._on_point_name_changed)
+        self.marked_points_table.setMinimumWidth(200)
+        self.marked_points_table.setMaximumWidth(300)
+        self.marked_points_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #dadce0;
+                border-radius: 4px;
+                background-color: #ffffff;
+                gridline-color: #e8eaed;
+            }
+            QTableWidget::item {
+                padding: 4px 8px;
+            }
+            QTableWidget::item:selected {
+                background-color: #1a73e8;
+                color: #ffffff;
+            }
+            QTableWidget::item:hover:!selected {
+                background-color: #e8f0fe;
+            }
+            QHeaderView::section {
+                background-color: #f8f9fa;
+                border: none;
+                border-bottom: 1px solid #dadce0;
+                padding: 6px 8px;
+                font-weight: bold;
+            }
+        """)
+        # 安裝事件過濾器處理鍵盤刪除
+        self.marked_points_table.installEventFilter(self)
+        points_layout.addWidget(self.marked_points_table, 1)
+
+        # 標記點操作按鈕
+        points_btn_layout = QHBoxLayout()
+        points_btn_layout.setSpacing(4)
+
+        self.delete_point_btn = QPushButton("刪除選中")
+        self.delete_point_btn.clicked.connect(self._delete_selected_point)
+        self.delete_point_btn.setProperty("secondary", True)
+        points_btn_layout.addWidget(self.delete_point_btn)
+
+        self.clear_points_btn = QPushButton("清除全部")
+        self.clear_points_btn.clicked.connect(self._clear_all_points)
+        self.clear_points_btn.setProperty("secondary", True)
+        points_btn_layout.addWidget(self.clear_points_btn)
+
+        points_layout.addLayout(points_btn_layout)
+
+        # 提示
+        points_hint = QLabel("拍照後點擊圖片標記點位\n點位將用於外參計算")
+        points_hint.setProperty("subheading", True)
+        points_hint.setStyleSheet("color: #5f6368; font-size: 11px;")
+        points_hint.setWordWrap(True)
+        points_layout.addWidget(points_hint)
+
+        center_splitter.addWidget(points_container)
+        center_splitter.setSizes([700, 250])
+        center_splitter.setStretchFactor(0, 1)
+        center_splitter.setStretchFactor(1, 0)
+
+        main_layout.addWidget(center_splitter, 1)
+
+        # ===== WebCAM 狀態變數 =====
+        self._webcam_worker = None
+        self._captured_frame = None
+        self._is_paused = False
+        self._current_frame = None
+
+        # 影像尺寸
+        self._image_width = 0
+        self._image_height = 0
+
+        # 初始掃描相機
+        self._scan_cameras()
+
+        return container
+
+    # ===== ImageViewer 信號處理 =====
+
+    def _on_point_added(self, img_x: float, img_y: float):
+        """新增標記點"""
+        # 生成點名稱 (A, B, C, ..., AA, AB, ...)
+        point_index = len(self._marked_points)
+        if point_index < 26:
+            point_name = chr(ord('A') + point_index)
+        else:
+            point_name = chr(ord('A') + point_index // 26 - 1) + chr(ord('A') + point_index % 26)
+
+        # 新增標記點
+        self._marked_points.append({
+            'name': point_name,
+            'pixel_x': img_x,
+            'pixel_y': img_y,
+            'world_x': None,
+            'world_y': None,
+        })
+
+        # 更新顯示
+        self._refresh_points_display(select_row=len(self._marked_points) - 1)
+        self.webcam_status.setText(f"已標記點 {point_name} ({img_x:.1f}, {img_y:.1f})")
+
+    def _on_point_selected(self, index: int):
+        """選中現有標記點"""
+        if 0 <= index < len(self._marked_points):
+            self._select_table_row(index)
+            point = self._marked_points[index]
+            self.webcam_status.setText(f"已選中點 {point['name']}")
+
+    def _on_viewer_mouse_moved(self, img_x: float, img_y: float):
+        """滑鼠在圖像上移動"""
+        self.webcam_coord_label.setText(f"({img_x:.1f}, {img_y:.1f})")
+
+    def _on_viewer_mouse_left(self):
+        """滑鼠離開圖像"""
+        self.webcam_coord_label.setText("")
+
+    def eventFilter(self, obj, event):
+        """事件過濾器 - 處理表格鍵盤事件"""
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+
+        if obj == self.marked_points_table and event.type() == QEvent.KeyPress:
+            key = event.key()
+            # Delete 或 Backspace 刪除選中點
+            if key in (Qt.Key_Delete, Qt.Key_Backspace):
+                self._delete_selected_point()
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def _on_point_name_changed(self, row: int, column: int):
+        """當標記點名稱被編輯時"""
+        import re
+
+        # 只處理名稱欄位（第 0 欄）
+        if column != 0 or row >= len(self._marked_points):
+            return
+
+        item = self.marked_points_table.item(row, column)
+        if item is None:
+            return
+
+        new_name = item.text().strip()
+        old_name = self._marked_points[row]['name']
+
+        # 驗證名稱
+        # 1. 移除中文字符（只保留英文、數字、底線、連字號）
+        new_name = re.sub(r'[^\x00-\x7F]', '', new_name)
+        # 2. 限制 10 個字元
+        new_name = new_name[:10]
+        # 3. 如果為空，恢復舊名稱
+        if not new_name:
+            new_name = old_name
+
+        # 更新數據和顯示
+        self._marked_points[row]['name'] = new_name
+
+        # 如果名稱被修改過，更新表格顯示
+        if new_name != item.text():
+            self.marked_points_table.blockSignals(True)
+            item.setText(new_name)
+            self.marked_points_table.blockSignals(False)
+
+        # 更新 ImageViewer 中的標記點顯示
+        self.image_viewer.set_points(self._marked_points)
+
+        # 更新外參表格
+        self._update_extrinsic_points_table()
+
+        self.webcam_status.setText(f"點位名稱已更新為 {new_name}")
+
+    def _refresh_points_display(self, select_row: int = -1):
+        """刷新標記點顯示（表格 + 圖像）"""
+        # 更新表格
+        self._update_marked_points_table()
+
+        # 選中指定行
+        if select_row >= 0:
+            self._select_table_row(select_row)
+
+        # 更新 ImageViewer 中的標記點
+        self.image_viewer.set_points(self._marked_points)
+
+        # 更新外參頁籤
+        self._update_extrinsic_points_table()
+
+    def _update_marked_points_table(self, select_last: bool = False):
+        """更新標記點表格"""
+        from PySide6.QtWidgets import QTableWidgetItem
+        from PySide6.QtCore import QTimer
+
+        # 暫時阻止信號避免觸發不必要的事件
+        self.marked_points_table.blockSignals(True)
+
+        self.marked_points_table.setRowCount(len(self._marked_points))
+        for i, point in enumerate(self._marked_points):
+            # 名稱欄位（可編輯）
+            name_item = QTableWidgetItem(point['name'])
+            self.marked_points_table.setItem(i, 0, name_item)
+
+            # X 座標（唯讀）
+            x_item = QTableWidgetItem(f"{point['pixel_x']:.1f}")
+            x_item.setFlags(x_item.flags() & ~Qt.ItemIsEditable)
+            self.marked_points_table.setItem(i, 1, x_item)
+
+            # Y 座標（唯讀）
+            y_item = QTableWidgetItem(f"{point['pixel_y']:.1f}")
+            y_item.setFlags(y_item.flags() & ~Qt.ItemIsEditable)
+            self.marked_points_table.setItem(i, 2, y_item)
+
+        self.marked_points_table.blockSignals(False)
+
+        # 選中最後一個項目（高亮新加的點）- 延遲執行確保 UI 更新完成
+        if select_last and len(self._marked_points) > 0:
+            last_row = len(self._marked_points) - 1
+            # 使用 QTimer.singleShot 確保在事件循環中執行
+            QTimer.singleShot(0, lambda: self._select_table_row(last_row))
+
+    def _select_table_row(self, row: int):
+        """選中表格中指定的行"""
+        if row < self.marked_points_table.rowCount():
+            self.marked_points_table.clearSelection()
+            self.marked_points_table.selectRow(row)
+            item = self.marked_points_table.item(row, 0)
+            if item:
+                self.marked_points_table.scrollToItem(item)
+
+    def _delete_selected_point(self):
+        """刪除選中的標記點"""
+        selected_rows = self.marked_points_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return
+
+        # 從後往前刪除，避免索引問題
+        indices = sorted([row.row() for row in selected_rows], reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self._marked_points):
+                del self._marked_points[idx]
+
+        # 重新命名點位
+        self._rename_points()
+
+        # 更新顯示（使用統一的刷新方法）
+        self._refresh_points_display()
+        self.webcam_status.setText(f"已刪除 {len(indices)} 個標記點")
+
+    def _clear_all_points(self):
+        """清除所有標記點"""
+        if not self._marked_points:
+            return
+
+        reply = QMessageBox.question(
+            self, "確認清除",
+            f"確定要清除所有 {len(self._marked_points)} 個標記點嗎？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            self._marked_points.clear()
+            # 更新顯示（使用統一的刷新方法）
+            self._refresh_points_display()
+            self.webcam_status.setText("已清除所有標記點")
+
+    def _rename_points(self):
+        """重新命名所有點位（A, B, C, ...）"""
+        for i, point in enumerate(self._marked_points):
+            if i < 26:
+                point['name'] = chr(ord('A') + i)
+            else:
+                point['name'] = chr(ord('A') + i // 26 - 1) + chr(ord('A') + i % 26)
+
+    def _scan_cameras(self):
+        """掃描可用的相機裝置"""
+        import cv2
+
+        self.cam_combo.clear()
+        self.webcam_status.setText("正在掃描相機...")
+        QApplication.processEvents()
+
+        available_cameras = []
+        for i in range(5):  # 檢查前 5 個索引（減少掃描時間）
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                # 先設置高解析度再讀取
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+                ret, _ = cap.read()
+                if ret:
+                    # 獲取實際解析度
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    available_cameras.append((i, f"Camera {i} ({width}x{height})"))
+                cap.release()
+
+        if available_cameras:
+            for idx, name in available_cameras:
+                self.cam_combo.addItem(name, idx)
+            self.webcam_status.setText(f"找到 {len(available_cameras)} 個相機裝置")
+        else:
+            self.cam_combo.addItem("未找到相機", -1)
+            self.webcam_status.setText("未找到可用的相機裝置")
+
+    def _start_stream(self):
+        """開始相機串流（使用背景執行緒）"""
+        cam_idx = self.cam_combo.currentData()
+        if cam_idx is None or cam_idx < 0:
+            QMessageBox.warning(self, "警告", "請先選擇有效的相機裝置")
+            return
+
+        # 創建並啟動 Worker
+        self._webcam_worker = WebCamWorker(cam_index=cam_idx, parent=self)
+        self._webcam_worker.preview_ready.connect(self._on_preview_received)
+        self._webcam_worker.resolution_ready.connect(self._on_resolution_ready)
+        self._webcam_worker.error.connect(self._on_webcam_error)
+        self._webcam_worker.start()
+
+        # 更新按鈕狀態
+        self.start_stream_btn.setEnabled(False)
+        self.stop_stream_btn.setEnabled(True)
+        self.capture_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
+        self.cam_combo.setEnabled(False)
+        self.refresh_cam_btn.setEnabled(False)
+
+        self._is_paused = False
+        self._captured_frame = None
+        self.webcam_status.setText("啟動中...")
+        self.webcam_resolution.setText("")
+
+    def _on_resolution_ready(self, width: int, height: int):
+        """相機啟動後接收實際解析度"""
+        self.webcam_resolution.setText(f"{width} x {height}")
+        self.webcam_status.setText("串流中...")
+        self._image_width = width
+        self._image_height = height
+
+    def _on_webcam_error(self, error_msg: str):
+        """處理 WebCAM 錯誤"""
+        QMessageBox.critical(self, "相機錯誤", error_msg)
+        self._stop_stream()
+
+    def _on_preview_received(self, preview_qimage: QImage):
+        """
+        接收背景執行緒傳來的預覽影像（在主執行緒中執行）
+
+        Args:
+            preview_qimage: 已縮放的預覽用 QImage
+        """
+        from PySide6.QtGui import QPixmap
+
+        if self._is_paused:
+            return
+
+        # 將預覽圖縮放至填滿顯示區域
+        pixmap = QPixmap.fromImage(preview_qimage)
+        label_w = self.image_viewer.width()
+        label_h = self.image_viewer.height()
+
+        if label_w > 0 and label_h > 0:
+            scaled = pixmap.scaled(
+                label_w, label_h,
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation  # 快速縮放
+            )
+            self.image_viewer.setPixmap(scaled)
+        else:
+            self.image_viewer.setPixmap(pixmap)
+
+    def _stop_stream(self):
+        """停止相機串流"""
+        if self._webcam_worker is not None:
+            self._webcam_worker.stop()
+            self._webcam_worker = None
+
+        # 更新按鈕狀態
+        self.start_stream_btn.setEnabled(True)
+        self.stop_stream_btn.setEnabled(False)
+        self.capture_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
+        self.save_photo_btn.setEnabled(False)
+        self.cam_combo.setEnabled(True)
+        self.refresh_cam_btn.setEnabled(True)
+
+        self._is_paused = False
+        self._captured_frame = None
+        self.webcam_status.setText("串流已停止")
+        self.webcam_resolution.setText("")
+
+        # 清除 ImageViewer
+        self.image_viewer.set_image(None, interactive=False)
+        self.image_viewer.setText("請選擇相機並點擊「開始串流」")
+
+    def _capture_photo(self):
+        """拍照並暫停串流"""
+        from PySide6.QtGui import QPixmap
+        import cv2
+
+        if self._webcam_worker is None:
+            return
+
+        # 從背景執行緒獲取原始幀（線程安全）
+        frame, width, height = self._webcam_worker.get_frame()
+        if frame is None:
+            self.webcam_status.setText("拍照失敗：無法獲取畫面")
+            return
+
+        # 保存拍攝的照片（BGR 格式）
+        self._captured_frame = frame
+        self._is_paused = True
+        self._image_width = width
+        self._image_height = height
+
+        # 轉換為 QPixmap 並顯示
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_frame.shape
+        q_img = QImage(rgb_frame.data, w, h, ch * w, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_img)
+
+        # 使用 ImageViewer 顯示（啟用交互模式）
+        self.image_viewer.set_image(pixmap, interactive=True)
+        self.image_viewer.set_points(self._marked_points)
+        self.image_viewer.reset_view()
+
+        # 更新按鈕狀態
+        self.capture_btn.setEnabled(False)
+        self.resume_btn.setEnabled(True)
+        self.save_photo_btn.setEnabled(True)
+
+        if self._marked_points:
+            self.webcam_status.setText(f"已拍攝照片 - 點擊圖片標記點位 ({len(self._marked_points)} 個點)")
+        else:
+            self.webcam_status.setText("已拍攝照片 - 點擊圖片標記點位")
+
+    def _resume_stream(self):
+        """繼續串流"""
+        self._is_paused = False
+        self._captured_frame = None
+
+        # 重置 ImageViewer 狀態（關閉交互模式，串流時不需要）
+        self.image_viewer._interactive = False
+        self.image_viewer._pixmap = None
+
+        # 更新按鈕狀態
+        self.capture_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
+        self.save_photo_btn.setEnabled(False)
+        self.webcam_status.setText("串流中...")
+
+    def _save_captured_photo(self):
+        """儲存拍攝的照片"""
+        import cv2
+        from datetime import datetime
+
+        if self._captured_frame is None:
+            return
+
+        # 預設檔名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"capture_{timestamp}.jpg"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "儲存照片",
+            default_name,
+            "JPEG 圖像 (*.jpg);;PNG 圖像 (*.png);;所有檔案 (*.*)"
+        )
+
+        if file_path:
+            cv2.imwrite(file_path, self._captured_frame)
+            self.webcam_status.setText(f"照片已儲存: {Path(file_path).name}")
+
+            # 詢問是否加入標定圖像列表
+            reply = QMessageBox.question(
+                self,
+                "加入標定圖像",
+                "是否將此照片加入標定圖像列表？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self._add_image_to_list(file_path)
+
+    def _add_image_to_list(self, file_path: str):
+        """將圖像加入標定圖像列表"""
+        self.image_list.addItem(Path(file_path).name)
+        item = self.image_list.item(self.image_list.count() - 1)
+        item.setData(Qt.UserRole, file_path)
+        self.statusbar.showMessage(f"已加入圖像: {Path(file_path).name}")
+        logger.info(f"加入圖像: {file_path}")
+
+        # 如果已有內參，更新外參圖像下拉選單
+        if self._result is not None:
+            self._update_extrinsic_image_combo()
+
+    def _update_extrinsic_points_table(self):
+        """將 WebCAM 標記點同步到外參計算表格"""
+        from PySide6.QtWidgets import QTableWidgetItem
+
+        # 如果表格尚未創建，跳過
+        if not hasattr(self, 'ext_webcam_points_table'):
+            return
+
+        # 暫時斷開信號以避免遞迴
+        self.ext_webcam_points_table.blockSignals(True)
+
+        # 更新表格
+        self.ext_webcam_points_table.setRowCount(len(self._marked_points))
+
+        for i, point in enumerate(self._marked_points):
+            # 名稱欄位（唯讀）
+            name_item = QTableWidgetItem(point['name'])
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.ext_webcam_points_table.setItem(i, 0, name_item)
+
+            # 像素 X（唯讀）
+            px_item = QTableWidgetItem(f"{point['pixel_x']:.1f}")
+            px_item.setFlags(px_item.flags() & ~Qt.ItemIsEditable)
+            self.ext_webcam_points_table.setItem(i, 1, px_item)
+
+            # 像素 Y（唯讀）
+            py_item = QTableWidgetItem(f"{point['pixel_y']:.1f}")
+            py_item.setFlags(py_item.flags() & ~Qt.ItemIsEditable)
+            self.ext_webcam_points_table.setItem(i, 2, py_item)
+
+            # 世界 X（可編輯）
+            wx_val = "" if point['world_x'] is None else f"{point['world_x']:.2f}"
+            wx_item = QTableWidgetItem(wx_val)
+            self.ext_webcam_points_table.setItem(i, 3, wx_item)
+
+            # 世界 Y（可編輯）
+            wy_val = "" if point['world_y'] is None else f"{point['world_y']:.2f}"
+            wy_item = QTableWidgetItem(wy_val)
+            self.ext_webcam_points_table.setItem(i, 4, wy_item)
+
+        # 恢復信號
+        self.ext_webcam_points_table.blockSignals(False)
+
+        # 更新狀態和計算按鈕
+        self._check_extrinsic_ready()
+
+    def _on_ext_world_coord_changed(self, row: int, column: int):
+        """當外參表格中的世界座標被修改時"""
+        # 只處理世界座標欄位（第 3、4 欄）
+        if column < 3 or row >= len(self._marked_points):
+            return
+
+        item = self.ext_webcam_points_table.item(row, column)
+        if item is None:
+            return
+
+        text = item.text().strip()
+
+        try:
+            if text == "":
+                value = None
+            else:
+                value = float(text)
+
+            if column == 3:
+                self._marked_points[row]['world_x'] = value
+            elif column == 4:
+                self._marked_points[row]['world_y'] = value
+
+        except ValueError:
+            # 無效輸入，恢復原值
+            if column == 3:
+                old_val = self._marked_points[row]['world_x']
+            else:
+                old_val = self._marked_points[row]['world_y']
+
+            self.ext_webcam_points_table.blockSignals(True)
+            item.setText("" if old_val is None else f"{old_val:.2f}")
+            self.ext_webcam_points_table.blockSignals(False)
+            return
+
+        # 更新狀態
+        self._check_extrinsic_ready()
+
+    def _check_extrinsic_ready(self):
+        """檢查外參計算是否滿足條件，更新按鈕和狀態"""
+        if not hasattr(self, 'ext_webcam_points_table'):
+            return
+
+        # 計算有完整世界座標的點數
+        valid_points = sum(
+            1 for p in self._marked_points
+            if p['world_x'] is not None and p['world_y'] is not None
+        )
+
+        # 獲取當前算法的最低點數要求
+        algo = self.ext_algo_combo.currentData()
+        if algo == "SOLVEPNP_P3P":
+            min_points = 3
+            algo_name = "P3P"
+        elif algo == "SOLVEPNP_AP3P":
+            min_points = 3
+            algo_name = "AP3P"
+        else:
+            min_points = 4
+            algo_name = "PnP"
+
+        # 更新狀態標籤
+        total_points = len(self._marked_points)
+        if total_points == 0:
+            self.ext_webcam_points_status.setText("尚無標記點（請在 WebCAM 頁籤拍照並標記）")
+            self.ext_webcam_points_status.setStyleSheet("color: #ea4335;")
+        elif valid_points < min_points:
+            self.ext_webcam_points_status.setText(
+                f"已標記 {total_points} 點，有效 {valid_points} 點（{algo_name} 需要 ≥{min_points} 點）"
+            )
+            self.ext_webcam_points_status.setStyleSheet("color: #ea4335;")
+        else:
+            self.ext_webcam_points_status.setText(
+                f"已標記 {total_points} 點，有效 {valid_points} 點 ✓"
+            )
+            self.ext_webcam_points_status.setStyleSheet("color: #34a853;")
+
+        # 更新計算按鈕狀態（需要內參和足夠的點）
+        has_intrinsic = self._result is not None and self._result.intrinsic is not None
+        can_calculate = has_intrinsic and valid_points >= min_points
+
+        # 如果選擇使用 WebCAM 點位，則用這個條件
+        if hasattr(self, 'ext_use_points_radio') and self.ext_use_points_radio.isChecked():
+            self.ext_calibrate_btn.setEnabled(can_calculate)
 
     def _create_intrinsic_tab(self) -> QWidget:
         """建立內參標定頁籤"""
@@ -501,421 +1665,6 @@ class MainWindow(QMainWindow):
 
         return container
 
-    def _create_chessboard_gen_tab(self) -> QWidget:
-        """建立棋盤格世界座標生成頁籤 - 簡化版：使用左側全局棋盤格參數"""
-        from PySide6.QtWidgets import (
-            QTextEdit, QGroupBox, QPushButton,
-            QFormLayout, QDoubleSpinBox, QSpinBox, QComboBox,
-            QCheckBox,
-        )
-
-        # 主容器 - 上下分割：上方可視化，下方控制
-        container = QWidget()
-        main_layout = QVBoxLayout(container)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(12)
-
-        # ========== 上方：可視化區域（佔主要空間）==========
-        vis_container = QWidget()
-        vis_layout = QVBoxLayout(vis_container)
-        vis_layout.setContentsMargins(0, 0, 0, 0)
-        vis_layout.setSpacing(8)
-
-        # 標題行
-        header_layout = QHBoxLayout()
-        header = QLabel("座標系可視化")
-        header.setProperty("heading", True)
-        header_layout.addWidget(header)
-        header_layout.addStretch()
-
-        # 顯示控制 - 使用明顯的切換按鈕樣式
-        toggle_frame = QFrame()
-        toggle_frame.setStyleSheet("""
-            QFrame {
-                background-color: #f1f3f4;
-                border-radius: 8px;
-                padding: 4px;
-            }
-        """)
-        toggle_layout = QHBoxLayout(toggle_frame)
-        toggle_layout.setContentsMargins(4, 4, 4, 4)
-        toggle_layout.setSpacing(4)
-
-        toggle_style = """
-            QPushButton {
-                background-color: transparent;
-                border: none;
-                border-radius: 6px;
-                padding: 6px 12px;
-                font-size: 13px;
-                color: #5f6368;
-            }
-            QPushButton:checked {
-                background-color: #1a73e8;
-                color: white;
-            }
-            QPushButton:hover:!checked {
-                background-color: #e8eaed;
-            }
-        """
-
-        self.show_image_coords_btn = QPushButton("視覺座標")
-        self.show_image_coords_btn.setCheckable(True)
-        self.show_image_coords_btn.setChecked(True)
-        self.show_image_coords_btn.setStyleSheet(toggle_style)
-        self.show_image_coords_btn.clicked.connect(self._update_chessboard_vis)
-        toggle_layout.addWidget(self.show_image_coords_btn)
-
-        self.show_world_coords_btn = QPushButton("世界座標")
-        self.show_world_coords_btn.setCheckable(True)
-        self.show_world_coords_btn.setChecked(True)
-        self.show_world_coords_btn.setStyleSheet(toggle_style)
-        self.show_world_coords_btn.clicked.connect(self._update_chessboard_vis)
-        toggle_layout.addWidget(self.show_world_coords_btn)
-
-        self.show_corners_btn = QPushButton("偵測角點")
-        self.show_corners_btn.setCheckable(True)
-        self.show_corners_btn.setChecked(False)
-        self.show_corners_btn.setStyleSheet(toggle_style)
-        self.show_corners_btn.clicked.connect(self._update_chessboard_vis)
-        toggle_layout.addWidget(self.show_corners_btn)
-
-        header_layout.addWidget(toggle_frame)
-        vis_layout.addLayout(header_layout)
-
-        # Matplotlib 畫布
-        try:
-            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-            from matplotlib.figure import Figure
-            import matplotlib
-            matplotlib.use('QtAgg')
-
-            # 設置中文字體
-            import matplotlib.pyplot as plt
-            plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS', 'sans-serif']
-            plt.rcParams['axes.unicode_minus'] = False
-
-            self.chessboard_fig = Figure(figsize=(10, 6), dpi=100)
-            self.chessboard_ax = self.chessboard_fig.add_subplot(111)
-            self.chessboard_canvas = FigureCanvas(self.chessboard_fig)
-            self.chessboard_canvas.setMinimumHeight(300)
-
-            # 啟用滾輪縮放和拖動
-            self._chessboard_vis_pressed = False
-            self._chessboard_vis_last_x = 0
-            self._chessboard_vis_last_y = 0
-            self.chessboard_canvas.mpl_connect('scroll_event', self._on_chessboard_scroll)
-            self.chessboard_canvas.mpl_connect('button_press_event', self._on_chessboard_press)
-            self.chessboard_canvas.mpl_connect('button_release_event', self._on_chessboard_release)
-            self.chessboard_canvas.mpl_connect('motion_notify_event', self._on_chessboard_motion)
-
-            vis_layout.addWidget(self.chessboard_canvas, 1)
-
-        except ImportError:
-            fallback_label = QLabel("需要安裝 matplotlib 才能顯示座標可視化\npip install matplotlib")
-            fallback_label.setAlignment(Qt.AlignCenter)
-            fallback_label.setStyleSheet("color: #666; font-size: 14px; padding: 40px;")
-            vis_layout.addWidget(fallback_label, 1)
-            self.chessboard_canvas = None
-
-        main_layout.addWidget(vis_container, 1)  # stretch=1，佔主要空間
-
-        # ========== 下方：控制區域（精簡）==========
-        ctrl_container = QWidget()
-        ctrl_layout = QHBoxLayout(ctrl_container)
-        ctrl_layout.setContentsMargins(0, 0, 0, 0)
-        ctrl_layout.setSpacing(16)
-
-        # --- 機械臂原點設定 ---
-        origin_group = QGroupBox("機械臂原點")
-        origin_layout = QFormLayout(origin_group)
-        origin_layout.setContentsMargins(12, 16, 12, 12)
-        origin_layout.setSpacing(6)
-
-        # 原點座標 (X, Y)
-        origin_coord_layout = QHBoxLayout()
-        origin_coord_layout.setSpacing(4)
-        self.origin_x_spin = QDoubleSpinBox()
-        self.origin_x_spin.setRange(-10000, 10000)
-        self.origin_x_spin.setDecimals(1)
-        self.origin_x_spin.setValue(0.0)
-        self.origin_x_spin.setSuffix(" mm")
-        self.origin_x_spin.valueChanged.connect(self._update_chessboard_vis)
-        origin_coord_layout.addWidget(QLabel("X:"))
-        origin_coord_layout.addWidget(self.origin_x_spin)
-        self.origin_y_spin = QDoubleSpinBox()
-        self.origin_y_spin.setRange(-10000, 10000)
-        self.origin_y_spin.setDecimals(1)
-        self.origin_y_spin.setValue(0.0)
-        self.origin_y_spin.setSuffix(" mm")
-        self.origin_y_spin.valueChanged.connect(self._update_chessboard_vis)
-        origin_coord_layout.addWidget(QLabel("Y:"))
-        origin_coord_layout.addWidget(self.origin_y_spin)
-        origin_layout.addRow("座標：", origin_coord_layout)
-
-        # 對應角點編號
-        self.robot_origin_point_spin = QSpinBox()
-        self.robot_origin_point_spin.setRange(1, 9999)
-        self.robot_origin_point_spin.setValue(204)
-        self.robot_origin_point_spin.setToolTip("棋盤格上對應機械臂原點的角點編號")
-        self.robot_origin_point_spin.valueChanged.connect(self._update_chessboard_vis)
-        origin_layout.addRow("角點 ID：", self.robot_origin_point_spin)
-
-        ctrl_layout.addWidget(origin_group)
-
-        # --- 座標軸方向 ---
-        dir_group = QGroupBox("座標軸對應")
-        dir_layout = QFormLayout(dir_group)
-        dir_layout.setContentsMargins(12, 16, 12, 12)
-        dir_layout.setSpacing(6)
-
-        self.robot_x_dir_combo = QComboBox()
-        self.robot_x_dir_combo.addItem("圖像Y+ (向下)", "image_y_positive")
-        self.robot_x_dir_combo.addItem("圖像Y- (向上)", "image_y_negative")
-        self.robot_x_dir_combo.addItem("圖像X+ (向右)", "image_x_positive")
-        self.robot_x_dir_combo.addItem("圖像X- (向左)", "image_x_negative")
-        self.robot_x_dir_combo.currentIndexChanged.connect(self._update_chessboard_vis)
-        dir_layout.addRow("機械臂 X+：", self.robot_x_dir_combo)
-
-        self.robot_y_dir_combo = QComboBox()
-        self.robot_y_dir_combo.addItem("圖像X+ (向右)", "image_x_positive")
-        self.robot_y_dir_combo.addItem("圖像X- (向左)", "image_x_negative")
-        self.robot_y_dir_combo.addItem("圖像Y+ (向下)", "image_y_positive")
-        self.robot_y_dir_combo.addItem("圖像Y- (向上)", "image_y_negative")
-        self.robot_y_dir_combo.currentIndexChanged.connect(self._update_chessboard_vis)
-        dir_layout.addRow("機械臂 Y+：", self.robot_y_dir_combo)
-
-        ctrl_layout.addWidget(dir_group)
-
-        # --- 操作按鈕 + 結果 ---
-        action_group = QGroupBox("操作")
-        action_layout = QVBoxLayout(action_group)
-        action_layout.setContentsMargins(12, 16, 12, 12)
-        action_layout.setSpacing(6)
-
-        gen_btn = QPushButton("生成世界座標")
-        gen_btn.clicked.connect(self._on_generate_world_coords)
-        gen_btn.setToolTip("使用左側「棋盤格參數」生成世界座標")
-        action_layout.addWidget(gen_btn)
-
-        load_btn = QPushButton("載入到點位數據")
-        load_btn.clicked.connect(self._on_load_world_coords_to_points)
-        load_btn.setToolTip("合併角點與世界座標")
-        action_layout.addWidget(load_btn)
-
-        self.chessboard_gen_status = QLabel("使用左側棋盤格參數")
-        self.chessboard_gen_status.setProperty("subheading", True)
-        self.chessboard_gen_status.setWordWrap(True)
-        action_layout.addWidget(self.chessboard_gen_status)
-
-        ctrl_layout.addWidget(action_group)
-
-        # --- 結果摘要 ---
-        result_group = QGroupBox("生成結果")
-        result_layout = QVBoxLayout(result_group)
-        result_layout.setContentsMargins(12, 16, 12, 12)
-
-        self.chessboard_gen_result = QTextEdit()
-        self.chessboard_gen_result.setReadOnly(True)
-        self.chessboard_gen_result.setMaximumHeight(80)
-        self.chessboard_gen_result.setPlaceholderText("點擊「生成世界座標」查看結果")
-        result_layout.addWidget(self.chessboard_gen_result)
-
-        ctrl_layout.addWidget(result_group, 1)
-
-        main_layout.addWidget(ctrl_container)
-
-        # 初始繪製
-        if hasattr(self, 'chessboard_canvas') and self.chessboard_canvas:
-            self._init_chessboard_vis()
-
-        return container
-
-    def _on_global_param_changed(self):
-        """當左側全局棋盤格參數變更時更新可視化"""
-        if hasattr(self, 'chessboard_ax') and self.chessboard_ax is not None:
-            self._update_chessboard_vis()
-
-    def _init_chessboard_vis(self):
-        """初始化棋盤格可視化"""
-        if not hasattr(self, 'chessboard_ax') or self.chessboard_ax is None:
-            return
-        self._update_chessboard_vis()
-
-    def _update_chessboard_vis(self):
-        """更新棋盤格座標可視化"""
-        if not hasattr(self, 'chessboard_ax') or self.chessboard_ax is None:
-            return
-
-        import numpy as np
-
-        self.chessboard_ax.clear()
-
-        # 獲取當前設置（使用左側全局棋盤格參數）
-        try:
-            grid_x = self.cols_spin.value()  # 使用全局參數
-            grid_y = self.rows_spin.value()  # 使用全局參數
-            robot_point = self.robot_origin_point_spin.value()
-            spacing = self.square_size_spin.value() * 10  # cm → mm
-        except:
-            grid_x, grid_y, robot_point, spacing = 17, 12, 204, 10.0
-
-        # ===== 顯示視覺座標系（模擬的棋盤格點位）=====
-        if self.show_image_coords_btn.isChecked():
-            points_x = []
-            points_y = []
-            for j in range(grid_y):
-                for i in range(grid_x):
-                    x = 200 + i * 40
-                    y = 150 + j * 40
-                    points_x.append(x)
-                    points_y.append(y)
-
-            self.chessboard_ax.scatter(points_x, points_y, c='lightblue', s=60, alpha=0.7,
-                                       edgecolor='blue', label='視覺座標系點位', marker='s')
-
-            # 標出機械臂原點在視覺座標系中的位置
-            if 1 <= robot_point <= len(points_x):
-                robot_idx = robot_point - 1
-                robot_x = points_x[robot_idx]
-                robot_y = points_y[robot_idx]
-
-                self.chessboard_ax.scatter([robot_x], [robot_y], c='red', s=200, marker='*',
-                                           edgecolor='darkred', linewidth=2, label=f'機械臂原點 (P{robot_point})')
-
-                # 繪製機械臂座標軸方向
-                robot_x_dir = self.robot_x_dir_combo.currentData()
-                robot_y_dir = self.robot_y_dir_combo.currentData()
-
-                arrow_length = 80
-                robot_x_dx, robot_x_dy = self._get_direction_vector(robot_x_dir, arrow_length)
-                robot_y_dx, robot_y_dy = self._get_direction_vector(robot_y_dir, arrow_length)
-
-                self.chessboard_ax.arrow(robot_x, robot_y, robot_x_dx, robot_x_dy,
-                                         head_width=12, head_length=15, fc='green', ec='green', linewidth=3)
-                self.chessboard_ax.arrow(robot_x, robot_y, robot_y_dx, robot_y_dy,
-                                         head_width=12, head_length=15, fc='orange', ec='orange', linewidth=3)
-
-                self.chessboard_ax.text(robot_x + robot_x_dx + 15, robot_y + robot_x_dy + 15, '機械臂X+',
-                                        fontsize=10, color='green', weight='bold')
-                self.chessboard_ax.text(robot_x + robot_y_dx + 15, robot_y + robot_y_dy + 15, '機械臂Y+',
-                                        fontsize=10, color='orange', weight='bold')
-
-        # ===== 顯示真實世界座標系 =====
-        if self.show_world_coords_btn.isChecked() and self._generated_world_coords:
-            world_coords = np.array(self._generated_world_coords)
-            world_x = world_coords[:, 1]
-            world_y = world_coords[:, 2]
-
-            self.chessboard_ax.scatter(world_x, world_y, c='lightgreen', s=60, alpha=0.7,
-                                       edgecolor='darkgreen', label='真實世界座標', marker='o')
-
-            # 標出機械臂原點在世界座標系中的位置
-            if 1 <= robot_point <= len(world_coords):
-                robot_world_x = world_coords[robot_point - 1, 1]
-                robot_world_y = world_coords[robot_point - 1, 2]
-
-                self.chessboard_ax.scatter([robot_world_x], [robot_world_y], c='darkred', s=200, marker='*',
-                                           edgecolor='red', linewidth=2, label='機械臂原點 (世界座標)')
-
-                # 世界座標系中的軸
-                self.chessboard_ax.arrow(robot_world_x, robot_world_y, spacing * 2, 0,
-                                         head_width=spacing * 0.5, head_length=spacing * 0.6, fc='cyan', ec='cyan', linewidth=3)
-                self.chessboard_ax.arrow(robot_world_x, robot_world_y, 0, spacing * 2,
-                                         head_width=spacing * 0.5, head_length=spacing * 0.6, fc='magenta', ec='magenta', linewidth=3)
-
-                self.chessboard_ax.text(robot_world_x + spacing * 2 + 5, robot_world_y + 5, '世界X+',
-                                        fontsize=10, color='cyan', weight='bold')
-                self.chessboard_ax.text(robot_world_x + 5, robot_world_y + spacing * 2 + 5, '世界Y+',
-                                        fontsize=10, color='magenta', weight='bold')
-
-        # ===== 顯示偵測到的角點 =====
-        if self.show_corners_btn.isChecked() and self._corner_cache:
-            # 使用第一張圖的角點作為示例
-            first_corners = list(self._corner_cache.values())[0] if self._corner_cache else None
-            if first_corners is not None:
-                corners = np.array(first_corners).reshape(-1, 2)
-                self.chessboard_ax.scatter(corners[:, 0], corners[:, 1],
-                                           c='red', s=100, marker='+', alpha=0.8, linewidths=3,
-                                           label='偵測到的角點')
-
-                # 標註部分角點編號
-                step = max(1, len(corners) // 20)
-                for i in range(0, len(corners), step):
-                    corner = corners[i]
-                    self.chessboard_ax.annotate(f'P{i + 1}', (corner[0], corner[1]),
-                                                xytext=(5, 5), textcoords='offset points',
-                                                fontsize=8, color='darkred', weight='bold',
-                                                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
-
-        # 設置圖表屬性
-        self.chessboard_ax.set_title('棋盤格座標系設置', fontsize=14, fontweight='bold')
-        self.chessboard_ax.set_xlabel('X座標')
-        self.chessboard_ax.set_ylabel('Y座標')
-        self.chessboard_ax.legend(loc='upper right', fontsize=9)
-        self.chessboard_ax.grid(True, alpha=0.3)
-        self.chessboard_ax.axis('equal')
-
-        self.chessboard_canvas.draw()
-
-    def _get_direction_vector(self, direction: str, length: float) -> tuple:
-        """根據方向字串返回向量"""
-        vectors = {
-            "image_x_positive": (length, 0),
-            "image_x_negative": (-length, 0),
-            "image_y_positive": (0, length),
-            "image_y_negative": (0, -length),
-        }
-        return vectors.get(direction, (0, 0))
-
-    def _on_chessboard_scroll(self, event):
-        """棋盤格可視化滾輪縮放"""
-        if event.inaxes != self.chessboard_ax:
-            return
-
-        xlim = self.chessboard_ax.get_xlim()
-        ylim = self.chessboard_ax.get_ylim()
-
-        scale_factor = 1.2 if event.step > 0 else 1 / 1.2
-
-        x_center = event.xdata if event.xdata else (xlim[0] + xlim[1]) / 2
-        y_center = event.ydata if event.ydata else (ylim[0] + ylim[1]) / 2
-
-        x_range = (xlim[1] - xlim[0]) / scale_factor
-        y_range = (ylim[1] - ylim[0]) / scale_factor
-
-        self.chessboard_ax.set_xlim([x_center - x_range / 2, x_center + x_range / 2])
-        self.chessboard_ax.set_ylim([y_center - y_range / 2, y_center + y_range / 2])
-        self.chessboard_canvas.draw()
-
-    def _on_chessboard_press(self, event):
-        """棋盤格可視化滑鼠按下"""
-        if event.button == 3 and event.inaxes == self.chessboard_ax:
-            self._chessboard_vis_pressed = True
-            self._chessboard_vis_last_x = event.xdata
-            self._chessboard_vis_last_y = event.ydata
-
-    def _on_chessboard_release(self, event):
-        """棋盤格可視化滑鼠釋放"""
-        if event.button == 3:
-            self._chessboard_vis_pressed = False
-
-    def _on_chessboard_motion(self, event):
-        """棋盤格可視化滑鼠拖動"""
-        if self._chessboard_vis_pressed and event.inaxes == self.chessboard_ax and event.xdata and event.ydata:
-            dx = event.xdata - self._chessboard_vis_last_x
-            dy = event.ydata - self._chessboard_vis_last_y
-
-            xlim = self.chessboard_ax.get_xlim()
-            ylim = self.chessboard_ax.get_ylim()
-
-            self.chessboard_ax.set_xlim([xlim[0] - dx, xlim[1] - dx])
-            self.chessboard_ax.set_ylim([ylim[0] - dy, ylim[1] - dy])
-
-            self._chessboard_vis_last_x = event.xdata
-            self._chessboard_vis_last_y = event.ydata
-
-            self.chessboard_canvas.draw()
 
     def _create_extrinsic_tab(self) -> QWidget:
         """建立外參計算頁籤"""
@@ -985,6 +1734,38 @@ class MainWindow(QMainWindow):
         method_layout.addLayout(corners_layout)
 
         layout.addWidget(method_group)
+
+        # ===== WebCAM 標記點 =====
+        webcam_points_group = QGroupBox("WebCAM 標記點")
+        webcam_points_layout = QVBoxLayout(webcam_points_group)
+        webcam_points_layout.setContentsMargins(12, 20, 12, 12)
+        webcam_points_layout.setSpacing(8)
+
+        webcam_points_desc = QLabel("從 WebCAM 頁籤標記的點位，請輸入對應的世界座標")
+        webcam_points_desc.setProperty("subheading", True)
+        webcam_points_desc.setWordWrap(True)
+        webcam_points_layout.addWidget(webcam_points_desc)
+
+        # 標記點表格
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        self.ext_webcam_points_table = QTableWidget()
+        self.ext_webcam_points_table.setColumnCount(5)
+        self.ext_webcam_points_table.setHorizontalHeaderLabels([
+            "名稱", "像素 X", "像素 Y", "世界 X", "世界 Y"
+        ])
+        self.ext_webcam_points_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ext_webcam_points_table.setMinimumHeight(120)
+        self.ext_webcam_points_table.setMaximumHeight(200)
+        self.ext_webcam_points_table.cellChanged.connect(self._on_ext_world_coord_changed)
+        webcam_points_layout.addWidget(self.ext_webcam_points_table)
+
+        # 點位狀態
+        self.ext_webcam_points_status = QLabel("尚無標記點（請在 WebCAM 頁籤拍照並標記）")
+        self.ext_webcam_points_status.setProperty("subheading", True)
+        self.ext_webcam_points_status.setStyleSheet("color: #ea4335;")
+        webcam_points_layout.addWidget(self.ext_webcam_points_status)
+
+        layout.addWidget(webcam_points_group)
 
         # ===== Excel 數據管理 =====
         excel_group = QGroupBox("Excel 數據管理")
@@ -1778,6 +2559,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'algo_desc_label'):
             self.algo_desc_label.setText(desc)
 
+        # 更新計算按鈕狀態
+        self._check_extrinsic_ready()
+
     @Slot()
     def _on_calibrate_extrinsic(self):
         """執行外參標定"""
@@ -1815,27 +2599,51 @@ class MainWindow(QMainWindow):
             # 根據選擇的方式進行計算
             if self.ext_use_points_radio.isChecked():
                 # 方式一：使用點位數據
-                if len(self._point_data) < min_points:
+                # 優先使用 WebCAM 標記點（如果有有效的點）
+                valid_webcam_points = [
+                    p for p in self._marked_points
+                    if p['world_x'] is not None and p['world_y'] is not None
+                ]
+
+                if len(valid_webcam_points) >= min_points:
+                    # 使用 WebCAM 標記點
+                    self.statusbar.showMessage("正在使用 WebCAM 標記點計算外參...")
+
+                    object_points = np.array(
+                        [[p['world_x'], p['world_y'], 0.0] for p in valid_webcam_points],
+                        dtype=np.float32
+                    )
+                    image_points = np.array(
+                        [[p['pixel_x'], p['pixel_y']] for p in valid_webcam_points],
+                        dtype=np.float32
+                    )
+                    source = "webcam_points"
+                    num_points = len(valid_webcam_points)
+                elif len(self._point_data) >= min_points:
+                    # 使用點位數據頁籤的數據
+                    self.statusbar.showMessage("正在使用點位數據計算外參...")
+
+                    object_points = np.array(
+                        [[p[3], p[4], 0.0] for p in self._point_data],
+                        dtype=np.float32
+                    )
+                    image_points = np.array(
+                        [[p[1], p[2]] for p in self._point_data],
+                        dtype=np.float32
+                    )
+                    source = "point_data"
+                    num_points = len(self._point_data)
+                else:
                     QMessageBox.warning(
                         self,
                         "點位不足",
                         f"選用的算法至少需要 {min_points} 個點位！\n"
-                        f"目前只有 {len(self._point_data)} 個點位。\n\n"
-                        "請前往「點位數據」頁籤添加點位。"
+                        f"WebCAM 標記點：{len(valid_webcam_points)} 個有效點\n"
+                        f"點位數據頁籤：{len(self._point_data)} 個點\n\n"
+                        "請在 WebCAM 頁籤標記點位並填入世界座標，\n"
+                        "或前往「點位數據」頁籤添加點位。"
                     )
                     return
-
-                self.statusbar.showMessage("正在使用點位數據計算外參...")
-
-                # 從 point_data 提取座標
-                object_points = np.array(
-                    [[p[3], p[4], 0.0] for p in self._point_data],
-                    dtype=np.float32
-                )
-                image_points = np.array(
-                    [[p[1], p[2]] for p in self._point_data],
-                    dtype=np.float32
-                )
 
                 # 執行 solvePnP
                 success, rvec, tvec = cv2.solvePnP(
@@ -1869,8 +2677,8 @@ class MainWindow(QMainWindow):
                 self._extrinsic_result = ExtrinsicCalibrationResult(
                     extrinsic=extrinsic,
                     reprojection_error=error,
-                    image_path="point_data",
-                    num_points=len(self._point_data),
+                    image_path=source,
+                    num_points=num_points,
                 )
 
             else:
@@ -2394,166 +3202,7 @@ class MainWindow(QMainWindow):
         self.statusbar.showMessage(f"已載入 {len(self._point_data)} 個點位")
         QMessageBox.information(
             self, "載入成功",
-            f"已載入 {len(self._point_data)} 個點位到數據表。\n\n"
-            + ("已合併世界座標。" if self._generated_world_coords else "世界座標尚未設定，請使用「棋盤生成」功能。")
-        )
-
-    # ===== 棋盤格世界座標生成 =====
-
-    def _get_direction_coeff(self, direction: str) -> tuple:
-        """獲取方向在網格座標系中的係數"""
-        if direction == "image_x_positive":
-            return (1, 0)
-        elif direction == "image_x_negative":
-            return (-1, 0)
-        elif direction == "image_y_positive":
-            return (0, 1)
-        elif direction == "image_y_negative":
-            return (0, -1)
-        return (1, 0)
-
-    @Slot()
-    def _on_generate_world_coords(self):
-        """生成棋盤格世界座標（使用左側全局棋盤格參數）"""
-        try:
-            origin_x = self.origin_x_spin.value()
-            origin_y = self.origin_y_spin.value()
-            grid_x = self.cols_spin.value()  # 使用全局參數
-            grid_y = self.rows_spin.value()  # 使用全局參數
-            spacing = self.square_size_spin.value() * 10  # cm → mm
-            robot_point = self.robot_origin_point_spin.value()
-
-            robot_x_dir = self.robot_x_dir_combo.currentData()
-            robot_y_dir = self.robot_y_dir_combo.currentData()
-
-            total_points = grid_x * grid_y
-            if robot_point < 1 or robot_point > total_points:
-                QMessageBox.warning(
-                    self, "參數錯誤",
-                    f"機械臂原點編號必須在 1 到 {total_points} 之間"
-                )
-                return
-
-            # 計算機械臂原點在棋盤格中的位置
-            robot_idx = robot_point - 1
-            robot_grid_i = robot_idx % grid_x
-            robot_grid_j = robot_idx // grid_x
-
-            # 獲取座標軸方向係數
-            robot_x_coeff = self._get_direction_coeff(robot_x_dir)
-            robot_y_coeff = self._get_direction_coeff(robot_y_dir)
-
-            # 計算行列式
-            det = robot_x_coeff[0] * robot_y_coeff[1] - robot_y_coeff[0] * robot_x_coeff[1]
-            if abs(det) < 1e-10:
-                QMessageBox.warning(self, "參數錯誤", "座標軸方向不能平行！")
-                return
-
-            # 逆矩陣
-            inv_11 = robot_y_coeff[1] / det
-            inv_12 = -robot_y_coeff[0] / det
-            inv_21 = -robot_x_coeff[1] / det
-            inv_22 = robot_x_coeff[0] / det
-
-            # 生成座標
-            self._generated_world_coords.clear()
-            point_id = 1
-            for j in range(grid_y):
-                for i in range(grid_x):
-                    grid_offset_i = i - robot_grid_i
-                    grid_offset_j = j - robot_grid_j
-
-                    robot_x_offset = inv_11 * grid_offset_i + inv_12 * grid_offset_j
-                    robot_y_offset = inv_21 * grid_offset_i + inv_22 * grid_offset_j
-
-                    world_x = origin_x + robot_x_offset * spacing
-                    world_y = origin_y + robot_y_offset * spacing
-
-                    self._generated_world_coords.append([point_id, world_x, world_y])
-                    point_id += 1
-
-            # 顯示結果
-            import numpy as np
-            coords_array = np.array(self._generated_world_coords)
-
-            result_text = f"""座標生成完成！
-
-總計 {len(self._generated_world_coords)} 個點
-
-棋盤格規格: {grid_x} × {grid_y}
-格子間距: {spacing:.2f} mm
-機械臂原點: P{robot_point} = ({origin_x:.1f}, {origin_y:.1f}) mm
-
-座標範圍:
-  X: {coords_array[:, 1].min():.1f} ~ {coords_array[:, 1].max():.1f} mm
-  Y: {coords_array[:, 2].min():.1f} ~ {coords_array[:, 2].max():.1f} mm
-
-關鍵點位:
-  P1: ({self._generated_world_coords[0][1]:.1f}, {self._generated_world_coords[0][2]:.1f}) mm
-  P{robot_point}: ({origin_x:.1f}, {origin_y:.1f}) mm
-  P{total_points}: ({self._generated_world_coords[-1][1]:.1f}, {self._generated_world_coords[-1][2]:.1f}) mm
-"""
-            self.chessboard_gen_result.setText(result_text)
-            self.statusbar.showMessage(f"已生成 {len(self._generated_world_coords)} 個世界座標")
-
-            # 更新可視化
-            self._update_chessboard_vis()
-
-        except Exception as e:
-            QMessageBox.critical(self, "生成失敗", f"生成座標失敗：{e}")
-            logger.error(f"生成世界座標失敗：{e}")
-
-    @Slot()
-    def _on_load_world_coords_to_points(self):
-        """將生成的世界座標載入到點位數據"""
-        if not self._generated_world_coords:
-            QMessageBox.warning(self, "無數據", "請先生成世界座標")
-            return
-
-        # 找到角點數據
-        corners_data = None
-        for path, corners in self._corner_cache.items():
-            if corners is not None:
-                corners_data = corners
-                break
-
-        if corners_data is None:
-            QMessageBox.warning(
-                self, "無角點數據",
-                "請先偵測圖像角點。\n\n"
-                "① 回到「內參標定」頁籤\n"
-                "② 載入圖像\n"
-                "③ 點擊「偵測角點」"
-            )
-            return
-
-        if len(corners_data) != len(self._generated_world_coords):
-            QMessageBox.warning(
-                self, "數量不匹配",
-                f"角點數量 ({len(corners_data)}) 與世界座標數量 "
-                f"({len(self._generated_world_coords)}) 不匹配！\n\n"
-                "請確保棋盤格參數一致。"
-            )
-            return
-
-        # 合併數據
-        self._point_data.clear()
-        for corner, world in zip(corners_data, self._generated_world_coords):
-            point_id = world[0]
-            img_x, img_y = corner[0], corner[1]
-            world_x, world_y = world[1], world[2]
-            self._point_data.append([point_id, img_x, img_y, world_x, world_y])
-
-        self._update_points_table()
-        self.statusbar.showMessage(f"已載入 {len(self._point_data)} 個點位到數據表")
-
-        # 切換到點位數據頁籤
-        self.tab_widget.setCurrentIndex(1)  # 點位數據頁籤
-
-        QMessageBox.information(
-            self, "載入成功",
-            f"已將 {len(self._point_data)} 個點位載入到數據表！\n\n"
-            "現在可以切換到「外參計算」頁籤進行外參計算。"
+            f"已載入 {len(self._point_data)} 個點位到數據表。"
         )
 
     # ===== 匯出外參 =====
